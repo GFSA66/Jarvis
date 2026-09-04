@@ -300,14 +300,14 @@ def save_note(text: str) -> None:
 def shutdown_system() -> None:
     result = os.system("shutdown /s /t 0")
     if result == 0:
-        notify("Система будет выключена.", ok=True)
+        notify("Выключаю.", ok=True)
     else:
         notify(f"Не удалось выключить систему (код возврата: {result}).", ok=False)
 
 def restart_system() -> None:
     result = os.system("shutdown /r /t 0")
     if result == 0:
-        notify("Система будет перезагружена.", ok=True)
+        notify("Перезагружаю.", ok=True)
     else:
         notify(f"Не удалось перезагрузить систему (код возврата: {result}).", ok=False)
 
