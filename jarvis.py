@@ -356,10 +356,10 @@ while True:
                     notify("Выход из программы.", ok=True)
                     break
                 
-                elif "выключ" in text and ("пк" in text or "компьютер" in text):
+                elif "выключ" in text and ("пк" in text or "компьютер" in text) and enjoing:
                     shutdown_system()
 
-                elif "перезагруз" in text and ("пк" in text or "компьютер" in text):
+                elif "перезагруз" in text and ("пк" in text or "компьютер" in text) and enjoing:
                     restart_system()
 
                 elif "запиши" in text or "заметк" in text:
@@ -390,7 +390,7 @@ while True:
                 elif ("роблокс" in text or "roblox" in text) and enjoing:
                     open_url(ROBLOX_URL, "Roblox")
 
-                elif ("логика" in text or "logika" in text) and enjoing:
+                elif ("логик" in text or "logik" in text) and enjoing:
                     open_url(LOGIKA_URL , "Logika Backoffice")
 
                 elif "стим" in text and "закр" in text:
