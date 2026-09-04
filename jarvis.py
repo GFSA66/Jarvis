@@ -17,8 +17,14 @@ try:
 except ImportError:
     pyttsx3 = None
 
+try:
+    from ytmusicapi import YTMusic
+except ImportError:
+    YTMusic = None
+
 import speech_recognition as sr
 import pyautogui
+import win32con
 import win32gui
 
 
@@ -67,6 +73,16 @@ GITHUB_URL = "https://github.com"
 PARTS_URL = "https://ek.ua/ua/"
 LOGIKA_URL = "https://backoffice.logikaschool.com.ua/groups/"
 
+# Фразы, после которых всё, что сказано дальше, считается названием трека
+# для поиска в YouTube Music. Порядок важен только косметически.
+TRACK_TRIGGERS = (
+    "включи трек",
+    "поставь трек",
+    "найди трек",
+    "поставь песню",
+    "найди песню",
+)
+
 # Steam-игры запускаем через протокол steam://rungameid/<appid> —
 # не завязано на путь установки, работает даже если библиотека Steam переедет.
 # Добавить новую игру: правый клик по игре в Steam -> "Свойства" (или зайди на её
@@ -103,6 +119,9 @@ VOICE_ID = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech\Voices\Tokens\TTS_MS_R
 COMMANDS_LIST = """Список команд Джарвиса:
 — выход — завершить программу
 — музыка — открыть YouTube Music (и продолжить последнюю песню)
+— закрой музыку — закрыть ВСЕ открытые окна YouTube Music (и основное, и с треками)
+— включи трек <название> / поставь трек <название> / найди трек <название> —
+  найти конкретную песню в YouTube Music и сразу её включить
 — геншин / genshin — запустить Genshin Impact
 — назови любую игру из GAMES (кс2, ведьмак, киберпанк, гта, найн солс, таунскейпер,
   блэк дезерт, ассасин, неон вайт, resident evil village, дайинг лайт,
@@ -236,8 +255,9 @@ def launch_app(path: str, name: str) -> None:
         notify(f"Не нашёл {name} по пути «{path}» — проверь путь.", ok=False)
 
 
-def _find_window_by_title_substring(substring: str):
-    """Ищет первое видимое окно верхнего уровня, в заголовке которого есть substring."""
+def _find_all_windows_by_title_substring(substring: str):
+    """Возвращает список ВСЕХ видимых окон верхнего уровня, в заголовке
+    которых встречается substring (регистронезависимо)."""
     substring_lower = substring.lower()
     result = []
 
@@ -249,7 +269,13 @@ def _find_window_by_title_substring(substring: str):
         return True
 
     win32gui.EnumWindows(callback, None)
-    return result[0] if result else None
+    return result
+
+
+def _find_window_by_title_substring(substring: str):
+    """Ищет первое видимое окно верхнего уровня, в заголовке которого есть substring."""
+    windows = _find_all_windows_by_title_substring(substring)
+    return windows[0] if windows else None
 
 
 def _wait_for_window(substring: str, timeout: float = 10.0, interval: float = 0.5):
@@ -289,9 +315,112 @@ def open_music() -> None:
     try:
         subprocess.Popen(YT_MUSIC_APP)
         notify("Открываю YouTube Music.", ok=True)
-        
+
     except FileNotFoundError:
         notify("Не нашёл chrome_proxy.exe — проверь путь.", ok=False)
+
+
+# --- Поиск и запуск конкретного трека -------------------------------------
+#
+# Идея: искать трек через неофициальный API YouTube Music (ytmusicapi),
+# который умеет искать без авторизации (см. документацию проекта:
+# "Unauthenticated requests for retrieving playlist content or searching").
+# Получаем videoId лучшего совпадения и открываем прямую ссылку
+# https://music.youtube.com/watch?v=<id> в отдельном "app-режиме" Chrome
+# (флаг --app=<url>, а не --app-id, поскольку --app-id открывает только
+# зафиксированный стартовый URL установленного PWA и не годится для
+# произвольного videoId).
+#
+# Установка: pip install ytmusicapi
+
+_ytmusic_client = None
+
+
+def _get_ytmusic_client():
+    """Ленивая инициализация клиента ytmusicapi (без авторизации,
+    только для публичного поиска)."""
+    global _ytmusic_client
+    if YTMusic is None:
+        return None
+    if _ytmusic_client is None:
+        _ytmusic_client = YTMusic()
+    return _ytmusic_client
+
+
+def _find_track_video_id(query: str):
+    """Возвращает videoId первого подходящего результата поиска
+    или None, если ничего не нашлось / клиент недоступен."""
+    yt = _get_ytmusic_client()
+    if yt is None:
+        return None
+    try:
+        results = yt.search(query, filter="songs", limit=5)
+        if not results:
+            results = yt.search(query, filter="videos", limit=5)
+        return results[0]["videoId"] if results else None
+    except Exception as e:
+        print(f"[Поиск трека] Ошибка запроса к YouTube Music: {e}")
+        return None
+
+
+def play_track(query: str) -> None:
+    """Ищет конкретный трек по названию и сразу включает его."""
+
+    def _worker():
+        if YTMusic is None:
+            notify(
+                "Поиск треков недоступен: не установлен пакет ytmusicapi "
+                "(выполни pip install ytmusicapi).",
+                ok=False,
+            )
+            return
+
+        notify(f"Ищу трек «{query}»…", ok=True)
+        video_id = _find_track_video_id(query)
+        if not video_id:
+            notify(f"Не нашёл трек «{query}».", ok=False)
+            return
+
+        url = f"https://music.youtube.com/watch?v={video_id}"
+        subprocess.Popen(MAIN_PROFILE_APP + [f"--app={url}"])
+        notify(f"Включаю «{query}».", ok=True)
+        # Подстраховка на случай, если автовоспроизведение не сработает
+        # (та же логика и тот же риск, что и в _resume_last_track: если
+        # видео и так уже начало играть само, пробел его поставит на паузу).
+        threading.Thread(target=_resume_last_track, daemon=True).start()
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def close_music_windows() -> None:
+    """Закрывает ВСЕ открытые окна YouTube Music — и основное PWA-окно
+    («музыка»), и окна с конкретными треками, открытые через play_track():
+    у всех у них в заголовке присутствует YT_MUSIC_WINDOW_TITLE.
+
+    Закрываем через WM_CLOSE (PostMessage), а не taskkill по имени процесса —
+    иначе заодно прибило бы и обычные окна Chrome с браузером/учёбой, которые
+    тоже работают через chrome.exe."""
+    windows = _find_all_windows_by_title_substring(YT_MUSIC_WINDOW_TITLE)
+    if not windows:
+        notify("Окна YouTube Music не найдены — закрывать нечего.", ok=False)
+        return
+
+    closed = 0
+    for hwnd in windows:
+        try:
+            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+            closed += 1
+        except Exception as e:
+            print(f"[Закрытие музыки] Не удалось закрыть окно {hwnd}: {e}")
+
+    if closed:
+        word = "окно" if closed == 1 else "окна" if closed < 5 else "окон"
+        notify(f"Закрываю {closed} музыкальных {word}.", ok=True)
+    else:
+        notify("Не удалось закрыть окна YouTube Music.", ok=False)
+
+
+# ---------------------------------------------------------------------------
 
 
 def open_study_profile() -> None:
@@ -428,9 +557,24 @@ while True:
                 elif "голос" in text and enjoing:
                     toggle_voice()
 
+                elif "музык" in text and "закр" in text:
+                    # Проверяем ДО открытия музыки, иначе "закрой музыку"
+                    # перехватилось бы веткой ниже и просто открыло бы новую.
+                    close_music_windows()
+
                 elif "музык" in text:
                     open_music()
-                
+
+                elif (trig := next((t for t in TRACK_TRIGGERS if t in text), None)) is not None:
+                    # ВАЖНО: эта ветка должна идти раньше проверки "песн" in text —
+                    # иначе "поставь песню Californication" перехватится веткой
+                    # продолжения последнего трека, так и не дойдя до поиска.
+                    query = text.split(trig, 1)[-1].strip()
+                    if query:
+                        play_track(query)
+                    else:
+                        notify("Не расслышал название трека.", ok=False)
+
                 elif "песн" in text:
                     threading.Thread(target=_resume_last_track, daemon=True).start()
 
