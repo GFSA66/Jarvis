@@ -18,6 +18,28 @@ except ImportError:
     pyttsx3 = None
 
 try:
+    import gettext as _gettext_module
+
+    _original_gettext_translation = _gettext_module.translation
+
+    def _gettext_translation_with_fallback(*args, **kwargs):
+        # ytmusicapi при создании YTMusic() зовёт gettext.translation(...) без
+        # fallback=True, чтобы подгрузить свои файлы локализации (.mo). Если
+        # собрать проект в .exe через PyInstaller/auto-py-to-exe, эти файлы
+        # (не .py-код, а данные) не попадают в сборку автоматически — и
+        # gettext.translation роняет FileNotFoundError прямо в конструкторе
+        # YTMusic(), хотя как обычный .py-скрипт всё работало нормально.
+        # Форсируем fallback=True: если файла нет, вернётся "нулевой" перевод
+        # (исходные строки без изменений) вместо падения — для языка по
+        # умолчанию (en) результат ровно тот же, что и с настоящим файлом.
+        kwargs.setdefault("fallback", True)
+        return _original_gettext_translation(*args, **kwargs)
+
+    _gettext_module.translation = _gettext_translation_with_fallback
+except ImportError:
+    pass
+
+try:
     from ytmusicapi import YTMusic
 except ImportError:
     YTMusic = None
@@ -79,7 +101,6 @@ TRACK_TRIGGERS = (
     "включи трек",
     "поставь трек",
     "найди трек",
-    "включи песню",
     "поставь песню",
     "найди песню",
 )
