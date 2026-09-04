@@ -59,6 +59,7 @@ FILMS_URL = "https://rezka.ag/films/best/"
 ANIME_URL = "https://old.yummyani.me/"
 GITHUB_URL = "https://github.com"
 PARTS_URL = "https://ek.ua/ua/"
+LOGIKA_URL = "https://backoffice.logikaschool.com.ua/groups/"
 
 # Steam-игры запускаем через протокол steam://rungameid/<appid> —
 # не завязано на путь установки, работает даже если библиотека Steam переедет.
@@ -195,7 +196,7 @@ def notify(message: str, ok: bool = True, duration_ms: int = 2000, force_speak: 
 
 voice_enabled = True
 r = sr.Recognizer()
-notify("Джарвис слушает вас, господин ...", ok=True)
+notify("Джарвис слушает вас, господин.", ok=True)
 
 
 def toggle_voice() -> None:
@@ -296,10 +297,26 @@ def save_note(text: str) -> None:
         f.write(f"[{timestamp}] {note}\n")
     notify(f"Записал: {note}", ok=True)
 
+def shutdown_system() -> None:
+    result = os.system("shutdown /s /t 0")
+    if result == 0:
+        notify("Система будет выключена.", ok=True)
+    else:
+        notify(f"Не удалось выключить систему (код возврата: {result}).", ok=False)
+
+def restart_system() -> None:
+    result = os.system("shutdown /r /t 0")
+    if result == 0:
+        notify("Система будет перезагружена.", ok=True)
+    else:
+        notify(f"Не удалось перезагрузить систему (код возврата: {result}).", ok=False)
 
 STOP_PHRASE = "огуречный салат"
 RESUME_PHRASE = "банановые кокосы"
+WORK_PHRASE = "скоро урок"
+ENJOY_PHRASE = "время игр"
 
+enjoing = True
 listening = True
 
 while True:
@@ -326,10 +343,24 @@ while True:
                     listening = False
                     notify(f"Джарвис на паузе. Скажите «{RESUME_PHRASE}», чтобы возобновить.", ok=True)
                     continue
+                
+                if WORK_PHRASE in text:
+                    enjoing = False
+                    notify("Включаю учебный режим.", ok=True)
+
+                if ENJOY_PHRASE in text:
+                    enjoing = True
+                    notify("Включаю игровой режим.", ok=True)
 
                 if "выход" in text:
                     notify("Выход из программы.", ok=True)
                     break
+                
+                elif "выключ" in text and ("пк" in text or "компьютер" in text):
+                    shutdown_system()
+
+                elif "перезагруз" in text and ("пк" in text or "компьютер" in text):
+                    restart_system()
 
                 elif "запиши" in text or "заметк" in text:
                     save_note(text)
@@ -338,26 +369,29 @@ while True:
                     print(COMMANDS_LIST)
                     notify("Все команды я вывел в консоль.", ok=True)
 
-                elif "голос" in text:
+                elif "голос" in text and enjoing:
                     toggle_voice()
 
                 elif "музык" in text:
                     open_music()
 
-                elif "геншин" in text or "genshin" in text:
+                elif "геншин" in text or "genshin" in text and enjoing:
                     launch_game()
 
                 elif (game_key := next((k for k in GAMES if k in text), None)) is not None:
                     launch_steam_game(game_key)
 
-                elif "майнкрафт" in text or "minecraft" in text:
+                elif "майнкрафт" in text or "minecraft" in text and enjoing:
                     launch_app(MINECRAFT_LAUNCHER_PATH, "Minecraft")
 
-                elif "призм" in text or "prism" in text:
+                elif "призм" in text or "prism" in text and enjoing:
                     launch_app(PRISM_LAUNCHER_PATH, "Prism Launcher")
 
-                elif "роблокс" in text or "roblox" in text:
+                elif ("роблокс" in text or "roblox" in text) and enjoing:
                     open_url(ROBLOX_URL, "Roblox")
+
+                elif ("логика" in text or "logika" in text) and enjoing:
+                    open_url(LOGIKA_URL , "Logika Backoffice")
 
                 elif "стим" in text and "закр" in text:
                     close_app("steam.exe", "Steam")
@@ -365,7 +399,7 @@ while True:
                 elif "steam" in text and "закр" in text:
                     close_app("steam.exe", "Steam")
 
-                elif "стим" in text or "steam" in text:
+                elif "стим" in text or "steam" in text and enjoing:
                     launch_app(STEAM_PATH, "Steam")
 
                 elif "дискорд" in text and "закр" in text:
@@ -374,7 +408,7 @@ while True:
                 elif "discord" in text and "закр" in text:
                     close_discord()
 
-                elif "дискорд" in text or "discord" in text:
+                elif "дискорд" in text or "discord" in text and enjoing:
                     launch_app(DISCORD_PATH, "Discord")
 
                 elif "телеграм" in text and "закр" in text:
@@ -389,14 +423,14 @@ while True:
                 elif "учеб" in text:
                     open_study_profile()
 
-                elif "пара" in text or "занят" in text or "урок" in text:
+                elif "пара" in text in text or "на пару" in text:
                     subprocess.Popen(STUDY_PROFILE_APP + [CLASSROOM_URL])
                     notify("Открываю Google Classroom в учебном профиле.", ok=True)
 
-                elif "фильм" in text or "кино" in text:
+                elif "фильм" in text or "кино" in text and enjoing:
                     open_url(FILMS_URL, "фильмы")
 
-                elif "аниме" in text:
+                elif "аниме" in text and enjoing:
                     open_url(ANIME_URL, "аниме")
 
                 elif "гитхаб" in text or "github" in text:
