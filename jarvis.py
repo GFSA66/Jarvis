@@ -79,6 +79,7 @@ TRACK_TRIGGERS = (
     "включи трек",
     "поставь трек",
     "найди трек",
+    "включи песню",
     "поставь песню",
     "найди песню",
 )
@@ -110,6 +111,7 @@ PRISM_LAUNCHER_PATH = r"D:\PrismLauncher\prismlauncher.exe"
 ROBLOX_URL = "https://www.roblox.com/home"
 
 NOTES_PATH = os.path.join(os.path.expanduser("~"), "Скрытая папка", "jarvis_notes.txt")
+ERROR_LOG_PATH = os.path.join(os.path.expanduser("~"), "Скрытая папка", "jarvis_errors.log")
 
 # Впиши сюда id понравившегося голоса — увидишь список в консоли при запуске
 # (обычно там что-то вроде "HKEY_LOCAL_MACHINE\...\Tokens\TTS_MS_RU-RU_..." для русского,
@@ -332,18 +334,51 @@ def open_music() -> None:
 # произвольного videoId).
 #
 # Установка: pip install ytmusicapi
+#
+# ВАЖНО для сборки в .exe (PyInstaller / auto-py-to-exe): ytmusicapi хранит
+# файлы переводов (.mo) в папке ytmusicapi/locales внутри самого пакета —
+# это данные, а не код, и PyInstaller их САМ НЕ подхватывает. Если после
+# сборки .exe поиск треков перестал работать (а как .py-скрипт работал) —
+# почти наверняка дело в этом. Решение — при сборке добавить сбор данных
+# пакета, см. инструкцию в конце файла / в чате.
 
 _ytmusic_client = None
 
 
+def _log_error(context: str, exc: Exception) -> None:
+    """Пишет traceback ошибки в файл-лог. Нужно на случай, если .exe собран
+    в режиме "Window Based" (без консоли) — тогда print() никто не увидит,
+    а лог-файл останется и его можно будет открыть и прочитать."""
+    import traceback
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{context}] {exc}"
+    print(line)
+    try:
+        os.makedirs(os.path.dirname(ERROR_LOG_PATH), exist_ok=True)
+        with open(ERROR_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {context}\n")
+            f.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+            f.write("\n")
+    except Exception:
+        pass  # даже если лог не записать — не роняем поток из-за этого
+
+
 def _get_ytmusic_client():
     """Ленивая инициализация клиента ytmusicapi (без авторизации,
-    только для публичного поиска)."""
+    только для публичного поиска). Раньше YTMusic() создавался ВНЕ
+    try/except — если конструктор падал (например, из-за недостающих
+    файлов локализации в собранном .exe), исключение вылетало в фоновом
+    потоке никем не пойманным и просто "тихо" всё ломало."""
     global _ytmusic_client
     if YTMusic is None:
         return None
     if _ytmusic_client is None:
-        _ytmusic_client = YTMusic()
+        try:
+            _ytmusic_client = YTMusic()
+        except Exception as e:
+            _log_error("Инициализация YTMusic()", e)
+            return None
     return _ytmusic_client
 
 
@@ -359,7 +394,7 @@ def _find_track_video_id(query: str):
             results = yt.search(query, filter="videos", limit=5)
         return results[0]["videoId"] if results else None
     except Exception as e:
-        print(f"[Поиск трека] Ошибка запроса к YouTube Music: {e}")
+        _log_error("Поиск трека в YouTube Music", e)
         return None
 
 
