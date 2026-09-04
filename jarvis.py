@@ -18,6 +18,8 @@ except ImportError:
     pyttsx3 = None
 
 import speech_recognition as sr
+import pyautogui
+import win32gui
 
 
 # Заранее прописанные сайты — никаких URL "из воздуха" по услышанному тексту.
@@ -43,6 +45,10 @@ YT_MUSIC_APP = [
     "--profile-directory=Default",
     "--app-id=cinhimbnkkaeohfgghhklpknlkffjgod",
 ]
+
+# Подстрока для поиска окна PWA YouTube Music среди всех окон — используется,
+# чтобы найти его и нажать пробел после загрузки (см. _resume_last_track).
+YT_MUSIC_WINDOW_TITLE = "YouTube Music"
 
 STUDY_PROFILE_APP = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -96,7 +102,7 @@ VOICE_ID = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech\Voices\Tokens\TTS_MS_R
 
 COMMANDS_LIST = """Список команд Джарвиса:
 — выход — завершить программу
-— музыка — открыть YouTube Music
+— музыка — открыть YouTube Music (и продолжить последнюю песню)
 — геншин / genshin — запустить Genshin Impact
 — назови любую игру из GAMES (кс2, ведьмак, киберпанк, гта, найн солс, таунскейпер,
   блэк дезерт, ассасин, неон вайт, resident evil village, дайинг лайт,
@@ -230,10 +236,60 @@ def launch_app(path: str, name: str) -> None:
         notify(f"Не нашёл {name} по пути «{path}» — проверь путь.", ok=False)
 
 
+def _find_window_by_title_substring(substring: str):
+    """Ищет первое видимое окно верхнего уровня, в заголовке которого есть substring."""
+    substring_lower = substring.lower()
+    result = []
+
+    def callback(hwnd, _):
+        if win32gui.IsWindowVisible(hwnd):
+            title = win32gui.GetWindowText(hwnd)
+            if substring_lower in title.lower():
+                result.append(hwnd)
+        return True
+
+    win32gui.EnumWindows(callback, None)
+    return result[0] if result else None
+
+
+def _wait_for_window(substring: str, timeout: float = 10.0, interval: float = 0.5):
+    """Опрашивает список окон, пока не появится совпадение или не истечёт timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        hwnd = _find_window_by_title_substring(substring)
+        if hwnd:
+            return hwnd
+        time.sleep(interval)
+    return None
+
+
+def _resume_last_track() -> None:
+    """Дожидается окна YouTube Music и жмёт пробел, чтобы продолжить последний трек.
+    Из-за политики автовоспроизведения Chrome сайт почти всегда открывается на паузе
+    с уже восстановленным треком/очередью — так что пробел практически гарантированно
+    ЗАПУСКАЕТ воспроизведение, а не ставит его на паузу."""
+    hwnd = _wait_for_window(YT_MUSIC_WINDOW_TITLE, timeout=10)
+    if not hwnd:
+        print("[YouTube Music] окно не появилось за 10 секунд — не могу нажать play.")
+        return
+    print(f"[YouTube Music] окно найдено: «{win32gui.GetWindowText(hwnd)}» (hwnd={hwnd})")
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+        print("[YouTube Music] SetForegroundWindow выполнен без ошибок.")
+    except Exception as e:
+        print(f"[YouTube Music] SetForegroundWindow упал: {e}")
+    time.sleep(0.3)
+    active_hwnd = win32gui.GetForegroundWindow()
+    active_title = win32gui.GetWindowText(active_hwnd)
+    print(f"[YouTube Music] активное окно перед нажатием пробела: «{active_title}»")
+    pyautogui.press("space")
+
+
 def open_music() -> None:
     try:
         subprocess.Popen(YT_MUSIC_APP)
         notify("Открываю YouTube Music.", ok=True)
+        
     except FileNotFoundError:
         notify("Не нашёл chrome_proxy.exe — проверь путь.", ok=False)
 
@@ -374,6 +430,9 @@ while True:
 
                 elif "музык" in text:
                     open_music()
+                
+                elif "песн" in text:
+                    threading.Thread(target=_resume_last_track, daemon=True).start()
 
                 elif "геншин" in text or "genshin" in text and enjoing:
                     launch_game()
