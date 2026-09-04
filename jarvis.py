@@ -1,14 +1,21 @@
 import os
 import sys
 import threading
+import time
 import tkinter as tk
 import subprocess
+from datetime import datetime
 
 try:
     import pyaudiowpatch as pyaudio
     sys.modules['pyaudio'] = pyaudio
 except ImportError:
     pass
+
+try:
+    import pyttsx3
+except ImportError:
+    pyttsx3 = None
 
 import speech_recognition as sr
 
@@ -29,6 +36,7 @@ GAME_PATH = r"D:\Epic Games\GenshinImpact\games\Genshin Impact game\GenshinImpac
 
 STEAM_PATH = r"D:\Steam\Steam.exe"
 DISCORD_PATH = r"C:\Users\GF66s\AppData\Local\Discord\app-1.0.9256\Discord.exe"
+TELEGRAM_PATH = r"C:\Users\GF66s\AppData\Roaming\Telegram Desktop\Telegram.exe"
 
 YT_MUSIC_APP = [
     r"C:\Program Files\Google\Chrome\Application\chrome_proxy.exe",
@@ -47,10 +55,102 @@ MAIN_PROFILE_APP = [
 ]
 
 CLASSROOM_URL = "https://classroom.google.com/c/ODc2MTc3NTI3Mzg5"
+FILMS_URL = "https://rezka.ag/films/best/"
+ANIME_URL = "https://old.yummyani.me/"
+GITHUB_URL = "https://github.com"
+PARTS_URL = "https://ek.ua/ua/"
+
+# Steam-игры запускаем через протокол steam://rungameid/<appid> —
+# не завязано на путь установки, работает даже если библиотека Steam переедет.
+# Добавить новую игру: правый клик по игре в Steam -> "Свойства" (или зайди на её
+# страницу магазина) -> появится число в URL store.steampowered.com/app/<appid>/...
+GAMES = {
+    "кс2": 730, "cs2": 730, "кс 2": 730, "cs 2": 730,
+    "ведьмак": 292030, "witcher": 292030,
+    "киберпанк": 1091500, "cyberpunk": 1091500,
+    "гта": 3240220, "gta": 3240220,
+    "найн солс": 1809540, "nine sols": 1809540,
+    "таунскейпер": 1291340, "townscaper": 1291340,
+    "блэк дезерт": 582660, "black desert": 582660, "черная пустыня": 582660,
+    "ассасин": 289650, "assassin": 289650,
+    "неон вайт": 1533420, "neon white": 1533420,
+    "резидент эвил вилладж": 1196590, "resident evil village": 1196590,
+    "резидент эвил реквием": 3764200, "resident evil requiem": 3764200,
+    "дайинг лайт": 3008130, "dying light": 3008130,
+    "меча хамелеон": 4704690, "chameleon": 4704690,
+    "синкинг сити": 750130, "sinking city": 750130,
+    "вольюм": 4245250, "vholume": 4245250,
+}
+
+# Не-Steam лаунчеры — пути по умолчанию, ПРОВЕРЬ и поправь под свою систему.
+MINECRAFT_LAUNCHER_PATH = r"C:\XboxGames\Minecraft Launcher\Content\Minecraft.exe"
+PRISM_LAUNCHER_PATH = r"D:\PrismLauncher\prismlauncher.exe"
+ROBLOX_URL = "https://www.roblox.com/home"
+
+NOTES_PATH = os.path.join(os.path.expanduser("~"), "Скрытая папка", "jarvis_notes.txt")
+
+# Впиши сюда id понравившегося голоса — увидишь список в консоли при запуске
+# (обычно там что-то вроде "HKEY_LOCAL_MACHINE\...\Tokens\TTS_MS_RU-RU_..." для русского,
+# либо "...ZIRA..."/"...DAVID..." для английских голосов).
+VOICE_ID = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech\Voices\Tokens\TTS_MS_RU-RU_IRINA_11.0"
+
+COMMANDS_LIST = """Список команд Джарвиса:
+— выход — завершить программу
+— музыка — открыть YouTube Music
+— геншин / genshin — запустить Genshin Impact
+— назови любую игру из GAMES (кс2, ведьмак, киберпанк, гта, найн солс, таунскейпер,
+  блэк дезерт, ассасин, неон вайт, resident evil village/requiem, дайинг лайт,
+  меча хамелеон, синкинг сити, вольюм) — запустится через Steam
+— майнкрафт / minecraft, призм / prism — запуск лаунчеров
+— роблокс / roblox — открыть сайт Roblox
+— стим / steam, закрой стим — запуск/закрытие Steam
+— дискорд / discord, закрой дискорд — запуск/закрытие Discord
+— телеграм / telegram, закрой телеграм — запуск/закрытие Telegram
+— учёба — Chrome с учебным профилем
+— пара / занятие / урок — Google Classroom
+— фильм / кино — rezka.ag
+— аниме — yummyani.me
+— гитхаб / github — github.com
+— комплектующие — ek.ua
+— закрой браузер — закрыть все окна Chrome
+— открой <сайт> — открыть сайт из списка (браузер, гугл, ютуб, клод и т.д.)
+— запиши <текст> / заметка <текст> — сохранить заметку
+— что ты умеешь / список команд — показать этот список
+— голос — включить/выключить голосовые ответы (текст и попапы остаются всегда)
+— огуречный салат — пауза, банановые кокосы — возобновление"""
 
 
-def notify(message: str, ok: bool = True, duration_ms: int = 2000) -> None:
-    """Маленькое всплывающее окно в правом нижнем углу на ~2 секунды.
+speaking_event = threading.Event()
+
+
+def speak(text: str) -> None:
+    """Озвучивает текст через pyttsx3 (офлайн-TTS), в отдельном потоке,
+    чтобы не блокировать прослушивание микрофона."""
+    if pyttsx3 is None:
+        return
+
+    def _speak():
+        speaking_event.set()  # "не слушай, я говорю" — иначе Джарвис услышит сам себя
+        try:
+            engine = pyttsx3.init()
+            if VOICE_ID:
+                engine.setProperty("voice", VOICE_ID)
+            engine.setProperty("rate", 175)
+            engine.say(text)
+            engine.runAndWait()
+            engine.stop()
+        except Exception as e:
+            print(f"Ошибка озвучки: {e}")
+        finally:
+            time.sleep(0.4)  # даём эху в комнате затихнуть перед тем как снова слушать
+            speaking_event.clear()
+
+    threading.Thread(target=_speak, daemon=True).start()
+
+
+def notify(message: str, ok: bool = True, duration_ms: int = 2000, force_speak: bool = False) -> None:
+    """Маленькое всплывающее окно в правом нижнем углу на ~2 секунды +
+    голосовой ответ через speak() (если voice_enabled, либо force_speak=True).
     ok=True — успешная команда (зеленоватый акцент), ok=False — неудачная (красноватый).
     Работает в отдельном потоке, чтобы не блокировать прослушивание микрофона.
     """
@@ -90,19 +190,36 @@ def notify(message: str, ok: bool = True, duration_ms: int = 2000) -> None:
     # daemon=False, чтобы последнее уведомление (например, при выходе)
     # успело показаться, даже если основной поток уже дошёл до конца.
     threading.Thread(target=_show, daemon=False).start()
+    if voice_enabled or force_speak:
+        speak(message)
 
 
+voice_enabled = True
 r = sr.Recognizer()
 notify("Джарвис слушает вас, господин ...", ok=True)
+
+
+def toggle_voice() -> None:
+    global voice_enabled
+    voice_enabled = not voice_enabled
+    state = "включён" if voice_enabled else "выключен"
+    # force_speak=True — подтверждение переключения звучит и показывается
+    # в любом случае, даже если голос только что выключили.
+    notify(f"Голосовой вывод {state}.", ok=True, force_speak=True)
 
 
 def open_site(name: str) -> None:
     url = SITES.get(name)
     if url:
         subprocess.Popen(MAIN_PROFILE_APP + [url])
-        notify(f"Открываю: {url}", ok=True)
+        notify(f"Открываю {name}.", ok=True)
     else:
         notify(f"Сайт «{name}» не в списке разрешённых — не открываю.", ok=False)
+
+
+def open_url(url: str, label: str) -> None:
+    subprocess.Popen(MAIN_PROFILE_APP + [url])
+    notify(f"Открываю {label}.", ok=True)
 
 
 def launch_app(path: str, name: str) -> None:
@@ -160,78 +277,150 @@ def launch_game() -> None:
         notify(f"Не удалось запустить задачу GenshinLaunch (код возврата: {result}).", ok=False)
 
 
+def launch_steam_game(key: str) -> None:
+    appid = GAMES.get(key)
+    if appid:
+        os.startfile(f"steam://rungameid/{appid}")
+        notify(f"Запускаю {key}.", ok=True)
+    else:
+        notify(f"Игра «{key}» не настроена.", ok=False)
+
+
+def save_note(text: str) -> None:
+    trigger = "запиши" if "запиши" in text else "заметк"
+    note = text.split(trigger, 1)[-1].strip()
+    if not note:
+        notify("Не расслышал, что записать.", ok=False)
+        return
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    with open(NOTES_PATH, "a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] {note}\n")
+    notify(f"Записал: {note}", ok=True)
+
+
 STOP_PHRASE = "огуречный салат"
 RESUME_PHRASE = "банановые кокосы"
 
 listening = True
 
 while True:
-    with sr.Microphone() as source:
-        audio = r.listen(source)
-        try:
-            text = r.recognize_google(audio, language="ru-RU").lower()
-            print(f"Вы сказали: {text}")
+    try:
+        if speaking_event.is_set():
+            time.sleep(0.1)
+            continue
 
-            # Пока на паузе — реагируем только на стоп-слово для возобновления,
-            # остальные команды игнорируем полностью.
-            if not listening:
-                if RESUME_PHRASE in text:
-                    listening = True
-                    notify("Джарвис снова слушает команды.", ok=True)
-                continue
+        with sr.Microphone() as source:
+            audio = r.listen(source)
+            try:
+                text = r.recognize_google(audio, language="ru-RU").lower()
+                print(f"Вы сказали: {text}")
 
-            if STOP_PHRASE in text:
-                listening = False
-                notify(f"Джарвис на паузе. Скажите «{RESUME_PHRASE}», чтобы возобновить.", ok=True)
-                continue
+                # Пока на паузе — реагируем только на стоп-слово для возобновления,
+                # остальные команды игнорируем полностью.
+                if not listening:
+                    if RESUME_PHRASE in text:
+                        listening = True
+                        notify("Джарвис снова слушает команды.", ok=True)
+                    continue
 
-            if "выход" in text:
-                notify("Выход из программы.", ok=True)
-                break
+                if STOP_PHRASE in text:
+                    listening = False
+                    notify(f"Джарвис на паузе. Скажите «{RESUME_PHRASE}», чтобы возобновить.", ok=True)
+                    continue
 
-            elif "музык" in text:
-                open_music()
+                if "выход" in text:
+                    notify("Выход из программы.", ok=True)
+                    break
 
-            elif "геншин" in text or "genshin" in text:
-                launch_game()
+                elif "запиши" in text or "заметк" in text:
+                    save_note(text)
 
-            elif "стим" in text and "закр" in text:
-                close_app("steam.exe", "Steam")
+                elif "что ты умеешь" in text or "список команд" in text or text.strip() == "помощь":
+                    print(COMMANDS_LIST)
+                    notify("Все команды я вывел в консоль.", ok=True)
 
-            elif "steam" in text and "закр" in text:
-                close_app("steam.exe", "Steam")
+                elif "голос" in text:
+                    toggle_voice()
 
-            elif "стим" in text or "steam" in text:
-                launch_app(STEAM_PATH, "Steam")
+                elif "музык" in text:
+                    open_music()
 
-            elif "дискорд" in text and "закр" in text:
-                close_discord()
+                elif "геншин" in text or "genshin" in text:
+                    launch_game()
 
-            elif "discord" in text and "закр" in text:
-                close_discord()
+                elif (game_key := next((k for k in GAMES if k in text), None)) is not None:
+                    launch_steam_game(game_key)
 
-            elif "дискорд" in text or "discord" in text:
-                launch_app(DISCORD_PATH, "Discord")
+                elif "майнкрафт" in text or "minecraft" in text:
+                    launch_app(MINECRAFT_LAUNCHER_PATH, "Minecraft")
 
-            elif "учеб" in text:
-                open_study_profile()
+                elif "призм" in text or "prism" in text:
+                    launch_app(PRISM_LAUNCHER_PATH, "Prism Launcher")
 
-            elif "пара" in text or "занят" in text or "урок" in text:
-                subprocess.Popen(STUDY_PROFILE_APP + [CLASSROOM_URL])
-                notify("Открываю Google Classroom в учебном профиле.", ok=True)
+                elif "роблокс" in text or "roblox" in text:
+                    open_url(ROBLOX_URL, "Roblox")
 
-            elif "браузер" in text and "закр" in text:
-                close_app("chrome.exe", "браузер")
+                elif "стим" in text and "закр" in text:
+                    close_app("steam.exe", "Steam")
 
-            elif "открой" in text:
-                requested = text.split("открой")[-1].strip()
-                matched = next((key for key in SITES if key in requested), None)
-                if matched:
-                    open_site(matched)
-                else:
-                    notify(f"Сайт «{requested}» не в списке разрешённых — не открываю.", ok=False)
+                elif "steam" in text and "закр" in text:
+                    close_app("steam.exe", "Steam")
 
-        except sr.UnknownValueError:
-            pass  # спокойно слушаем дальше, если был просто шум
-        except sr.RequestError as e:
-            print(f"Ошибка сервиса распознавания речи: {e}")
+                elif "стим" in text or "steam" in text:
+                    launch_app(STEAM_PATH, "Steam")
+
+                elif "дискорд" in text and "закр" in text:
+                    close_discord()
+
+                elif "discord" in text and "закр" in text:
+                    close_discord()
+
+                elif "дискорд" in text or "discord" in text:
+                    launch_app(DISCORD_PATH, "Discord")
+
+                elif "телеграм" in text and "закр" in text:
+                    close_app("Telegram.exe", "Telegram")
+
+                elif "telegram" in text and "закр" in text:
+                    close_app("Telegram.exe", "Telegram")
+
+                elif "телеграм" in text or "telegram" in text:
+                    launch_app(TELEGRAM_PATH, "Telegram")
+
+                elif "учеб" in text:
+                    open_study_profile()
+
+                elif "пара" in text or "занят" in text or "урок" in text:
+                    subprocess.Popen(STUDY_PROFILE_APP + [CLASSROOM_URL])
+                    notify("Открываю Google Classroom в учебном профиле.", ok=True)
+
+                elif "фильм" in text or "кино" in text:
+                    open_url(FILMS_URL, "фильмы")
+
+                elif "аниме" in text:
+                    open_url(ANIME_URL, "аниме")
+
+                elif "гитхаб" in text or "github" in text:
+                    open_url(GITHUB_URL, "GitHub")
+
+                elif "комплектующ" in text:
+                    open_url(PARTS_URL, "комплектующие")
+
+                elif "браузер" in text and "закр" in text:
+                    close_app("chrome.exe", "браузер")
+
+                elif "открой" in text:
+                    requested = text.split("открой")[-1].strip()
+                    matched = next((key for key in SITES if key in requested), None)
+                    if matched:
+                        open_site(matched)
+                    else:
+                        notify(f"Сайт «{requested}» не в списке разрешённых — не открываю.", ok=False)
+
+            except sr.UnknownValueError:
+                pass  # спокойно слушаем дальше, если был просто шум
+            except sr.RequestError as e:
+                print(f"Ошибка сервиса распознавания речи: {e}")
+    except Exception as e:
+        print(f"Ошибка при прослушивании микрофона: {e}")
+        time.sleep(1)  # небольшая пауза перед повторной попыткой
