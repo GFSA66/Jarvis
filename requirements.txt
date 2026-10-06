@@ -1,0 +1,7 @@
+SpeechRecognition>=3.10
+PyAudioWPatch
+pyttsx3
+pyautogui
+pywin32
+ytmusicapi
+customtkinter>=5.2
