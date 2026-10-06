@@ -31,6 +31,7 @@ from collections import namedtuple
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import quote_plus
 
 if sys.platform != "win32":
     sys.exit("Джарвис работает только на Windows.")
@@ -946,6 +947,9 @@ def is_pc(text: str) -> bool:
 
 
 TRACK_RE = re.compile(r"\b(?:включи|поставь|найди)\s+(?:трек|песню|песня)\s+(.+)")
+# «загугли X», «найди X», «найди в интернете X» (но «найди трек X» — это музыка, см. TRACK_RE)
+SEARCH_RE = re.compile(
+    r"\b(?:загугл\w*|погугл\w*|найди(?:те)?)\b\s*(?:в\s+(?:интернете|гугле|google|сети)\s+)?(.*)")
 Cmd = namedtuple("Cmd", "match run play_only")
 
 
@@ -955,6 +959,7 @@ def commands_text() -> str:
 — музыка — открыть YouTube Music; закрой музыку — закрыть все окна YouTube Music
 — песня — нажать play/pause в YouTube Music
 — включи/поставь/найди трек <название> — найти и включить трек
+— загугли <запрос> / найди <запрос> — поиск в Google (в Chrome)
 — геншин; майнкрафт; призм; роблокс — запуск игр и лаунчеров
 — игры Steam: {", ".join(sorted(CFG["games"]))}
 — стим / дискорд / телеграм (+ «закрой …») — запуск и закрытие
@@ -1036,6 +1041,14 @@ def cmd_voice(t):
 def cmd_track(t):
     m = TRACK_RE.search(t)
     play_track(m.group(1).strip())
+
+
+def cmd_search(t):
+    query = SEARCH_RE.search(t).group(1).strip(" .,!?")
+    if not query:
+        notify("Не расслышал, что искать.", ok=False)
+        return
+    open_url("https://www.google.com/search?q=" + quote_plus(query), f"поиск «{query}»")
 
 
 def cmd_genshin(t):
@@ -1159,6 +1172,8 @@ COMMANDS = [
     Cmd(lambda t: is_word(t, "выход", "выйти"), cmd_exit, False),
     Cmd(lambda t: is_word(t, "отмена", "отмени", "отменить"), cmd_cancel_shutdown, False),
     Cmd(lambda t: has(t, "настройк"), cmd_settings, False),
+    # раньше своих команд: «загугли кс2» должно искать, а не запускать игру
+    Cmd(lambda t: bool(SEARCH_RE.search(t)) and not TRACK_RE.search(t), cmd_search, False),
     Cmd(lambda t: _custom_match(t) is not None, cmd_custom, False),  # свои команды — раньше встроенных
     Cmd(lambda t: has(t, "выключ") and is_pc(t), cmd_shutdown, True),
     Cmd(lambda t: has(t, "перезагруз") and is_pc(t), cmd_restart, True),
