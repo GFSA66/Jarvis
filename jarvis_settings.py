@@ -7,12 +7,15 @@
 
 Автозапуск через Планировщик заданий тоже делает jarvis.py: сюда передаётся объект
 autostart с методами status(), apply(enabled, admin) и target_text().
+Вкладка «Нейросеть» получает модуль jarvis_ai (PRESETS, test_connection), а кнопка
+«Проверить голос» — функцию say(текст).
 """
 from __future__ import annotations
 
 import re
 import sys
 import threading
+import webbrowser
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog
@@ -361,7 +364,7 @@ def _short(text: str, limit: int = 90) -> str:
 #  Главное окно
 # ============================================================================
 
-def open_settings(root, cfg: dict, on_save, autostart=None) -> None:
+def open_settings(root, cfg: dict, on_save, autostart=None, ai=None, say=None) -> None:
     """Открыть окно (или поднять уже открытое). Вызывать из Tk-потока."""
     global _instance
     if _instance is not None:
@@ -375,12 +378,13 @@ def open_settings(root, cfg: dict, on_save, autostart=None) -> None:
             pass
     ctk.set_appearance_mode("dark")
     _fix_ru_hotkeys(root)
-    _instance = SettingsWindow(root, cfg, on_save, autostart)
+    _instance = SettingsWindow(root, cfg, on_save, autostart, ai, say)
 
 
 class SettingsWindow:
-    def __init__(self, root, cfg: dict, on_save, autostart=None):
+    def __init__(self, root, cfg: dict, on_save, autostart=None, ai=None, say=None):
         self.cfg, self.on_save, self.autostart = cfg, on_save, autostart
+        self.ai, self.say = ai, say
         w = self.win = ctk.CTkToplevel(root)
         w.title("Джарвис — настройки")
         w.geometry("940x700")
@@ -400,8 +404,10 @@ class SettingsWindow:
         tabs._segmented_button.configure(font=_font(13, True))
         tabs.pack(fill="both", expand=True, padx=16, pady=(0, 4))
 
-        t = {name: tabs.add(name) for name in
-             ("Мои команды", "Игры Steam", "Сайты", "Ссылки", "Общие", "Пути")}
+        names = ["Мои команды", "Игры Steam", "Сайты", "Ссылки", "Общие"]
+        if ai is not None:
+            names.append("Нейросеть")
+        t = {name: tabs.add(name) for name in names + ["Пути"]}
 
         self.t_cmd = TableTab(
             t["Мои команды"], w,
@@ -426,6 +432,8 @@ class SettingsWindow:
 
         self._build_links(t["Ссылки"])
         self._build_general(t["Общие"])
+        if ai is not None:
+            self._build_ai(t["Нейросеть"])
         self._build_paths(t["Пути"])
 
         self.t_cmd.load((c["phrase"], c["target"]) for c in cfg["commands"])
@@ -486,6 +494,10 @@ class SettingsWindow:
         self.sw_voice.grid(row=1, column=0, columnspan=3, sticky="w", padx=16, pady=5)
         if c["voice"]["enabled"]:
             self.sw_voice.select()
+        if self.say is not None:
+            _button(card, "🔊  Проверить голос",
+                    lambda: self.say("Проверка голоса. Джарвис на связи."), width=150).grid(
+                row=1, column=2, padx=(0, 16), pady=5)
         self.v_delay = _entry(card, str(c["shutdown_delay_sec"]), width=80)
         self._field(card, 2, "Задержка выключения / перезагрузки", self.v_delay, "секунд, от 0 до 600")
         self.v_delay.grid_configure(sticky="w")
@@ -550,6 +562,125 @@ class SettingsWindow:
             self._field(card, i, label, self.v_phr[key])
             self.v_phr[key].grid_configure(sticky="w")
         ctk.CTkFrame(card, fg_color="transparent", height=6).grid(row=len(PHRASE_LABELS) + 1, column=0)
+
+    def _build_ai(self, tab) -> None:
+        a, presets = self.cfg["ai"], self.ai.PRESETS
+        self._ai_labels = {k: v["label"] for k, v in presets.items()}
+        self._ai_by_label = {v: k for k, v in self._ai_labels.items()}
+        self._ai_prov = a["provider"] if a["provider"] in presets else "gemini"
+        pre = presets[self._ai_prov]
+
+        sf = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        sf.pack(fill="both", expand=True)
+        sf.grid_columnconfigure(0, weight=1)
+        card = self._card(sf, "Нейросеть: отвечает на вопросы голосом", 0)
+
+        self.sw_ai = ctk.CTkSwitch(card, text="Включить  («Джарвис, какую игру мне поиграть?»)",
+                                   font=_font(), progress_color=ACCENT)
+        self.sw_ai.grid(row=1, column=0, columnspan=3, sticky="w", padx=16, pady=5)
+        if a["enabled"]:
+            self.sw_ai.select()
+
+        self.om_prov = ctk.CTkOptionMenu(
+            card, values=list(self._ai_labels.values()), command=self._ai_provider_changed, width=300,
+            height=32, font=_font(), dropdown_font=_font(), fg_color=GHOST_H, button_color=ACCENT,
+            button_hover_color=ACCENT_H)
+        self.om_prov.set(self._ai_labels[self._ai_prov])
+        self._field(card, 2, "Провайдер", self.om_prov)
+        self.om_prov.grid_configure(sticky="w")
+        _button(card, "Получить ключ", self._ai_open_key_page, width=130).grid(row=2, column=2, padx=(0, 16))
+
+        self.v_ai_key = _entry(card, a["api_key"], placeholder="вставь API-ключ (Ctrl+V)")
+        self.v_ai_key.configure(show="•")
+        self._field(card, 3, "API-ключ", self.v_ai_key)
+        self.v_ai_model = _entry(card, a["model"] or pre["model"], width=300)
+        self._field(card, 4, "Модель", self.v_ai_model, "если ответ «модель не найдена» — поменяй")
+        self.v_ai_model.grid_configure(sticky="w")
+        self.v_ai_base = _entry(card, a["base_url"] or pre["base_url"])
+        self._field(card, 5, "Адрес API", self.v_ai_base)
+        self.v_ai_city = _entry(card, a["city"], width=200)
+        self._field(card, 6, "Город для погоды", self.v_ai_city)
+        self.v_ai_city.grid_configure(sticky="w")
+        self.v_ai_names = _entry(card, ", ".join(a["names"]), width=300)
+        self._field(card, 7, "Обращение к Джарвису", self.v_ai_names, "через запятую")
+        self.v_ai_names.grid_configure(sticky="w")
+        self.sw_ai_pc = ctk.CTkSwitch(card, text="Рассказывать нейросети про мой ПК (железо, игры Steam)",
+                                      font=_font(), progress_color=ACCENT)
+        self.sw_ai_pc.grid(row=8, column=0, columnspan=3, sticky="w", padx=16, pady=(8, 5))
+        if a.get("pc_context", True):
+            self.sw_ai_pc.select()
+
+        bar = ctk.CTkFrame(card, fg_color="transparent")
+        bar.grid(row=9, column=0, columnspan=3, sticky="ew", padx=16, pady=(8, 14))
+        self.btn_ai_test = _button(bar, "Проверить", self._ai_test, width=110)
+        self.btn_ai_test.pack(side="left")
+        self.lbl_ai_test = ctk.CTkLabel(bar, text="", font=_font(12), anchor="w", justify="left", wraplength=560)
+        self.lbl_ai_test.pack(side="left", padx=(12, 0), fill="x", expand=True)
+
+        info = self._card(sf, "Как это работает", 1)
+        ctk.CTkLabel(
+            info, font=_font(12), text_color=MUTED, justify="left", anchor="w", wraplength=760,
+            text=("1. Нажми «Получить ключ», войди в аккаунт и скопируй ключ. Карта не нужна.\n"
+                  "2. Вставь ключ, нажми «Проверить», затем «Сохранить».\n"
+                  "3. Скажи «Джарвис, какая сегодня погода?» — ответ придёт голосом и коротко.\n\n"
+                  "Нейросеть отвечает только на фразы со словом из «Обращение к Джарвису», чтобы разговоры рядом "
+                  "не тратили лимит. Команды вроде «открой ютуб» работают как раньше.\n\n"
+                  "Приватность: вопросы и данные о ПК (если включено) уходят провайдеру. У бесплатного Gemini "
+                  "вне ЕС запросы могут использоваться для обучения моделей. Ключ хранится в "
+                  "%USERPROFILE%\\.jarvis\\config.json открытым текстом. Не выкладывай этот файл.")
+        ).grid(row=1, column=0, sticky="w", padx=16, pady=(0, 14))
+
+    def _ai_provider_changed(self, label: str) -> None:
+        new = self.ai.PRESETS[self._ai_by_label[label]]
+        self._ai_prov = self._ai_by_label[label]
+        if self._ai_prov == "custom":  # «свой»: оставляем, что есть, пользователь впишет адрес и модель сам
+            return
+        for entry, key in ((self.v_ai_model, "model"), (self.v_ai_base, "base_url")):
+            entry.delete(0, "end")  # модель и адрес чужого провайдера новому не подходят
+            entry.insert(0, new[key])
+
+    def _ai_open_key_page(self) -> None:
+        url = self.ai.PRESETS[self._ai_prov]["key_url"]
+        if url:
+            webbrowser.open(url)
+
+    def _ai_form(self) -> dict:
+        pre = self.ai.PRESETS[self._ai_prov]
+        model, base = self.v_ai_model.get().strip(), self.v_ai_base.get().strip()
+        return {
+            "enabled": bool(self.sw_ai.get()),
+            "provider": self._ai_prov,
+            "api_key": self.v_ai_key.get().strip(),
+            "model": "" if model == pre["model"] else model,       # как у пресета — не фиксируем
+            "base_url": "" if base == pre["base_url"] else base,
+            "city": self.v_ai_city.get().strip() or "Днепр",
+            "names": [n for n in (_norm(x) for x in self.v_ai_names.get().split(",")) if n] or ["джарвис"],
+            "pc_context": bool(self.sw_ai_pc.get()),
+        }
+
+    def _ai_test(self) -> None:
+        self.lbl_ai_test.configure(text="Проверяю…", text_color=MUTED)
+        self.btn_ai_test.configure(state="disabled")
+        form, box = dict(self.cfg["ai"], **self._ai_form()), {}
+
+        def work():
+            box["res"] = self.ai.test_connection(form)
+
+        threading.Thread(target=work, daemon=True).start()
+
+        def poll():
+            try:
+                if "res" not in box:
+                    self.win.after(200, poll)
+                    return
+                ok, msg = box["res"]
+                self.btn_ai_test.configure(state="normal")
+                self.lbl_ai_test.configure(text=("✓ Работает. Ответ: " if ok else "✗ ") + msg,
+                                           text_color=OK_COLOR if ok else ERR_COLOR)
+            except tk.TclError:
+                pass
+
+        poll()
 
     def _build_paths(self, tab) -> None:
         tab.grid_columnconfigure(0, weight=1)
@@ -645,7 +776,13 @@ class SettingsWindow:
         phrases = {k: _norm(v.get()) for k, v in self.v_phr.items()}
         if not all(phrases.values()):
             raise ValueError("Фразы управления не должны быть пустыми.")
+        patch_ai = {}
+        if self.ai is not None:
+            patch_ai = {"ai": self._ai_form()}
+            if patch_ai["ai"]["enabled"] and not self.ai.resolve(patch_ai["ai"])[2]:
+                raise ValueError("Вставь API-ключ на вкладке «Нейросеть» или выключи нейросеть.")
         return {
+            **patch_ai,
             "commands": [{"phrase": p, "target": t} for p, t in self.t_cmd.rows()],
             "games": {p: int(a) for p, a in self.t_games.rows()},
             "sites": {p: u for p, u in self.t_sites.rows()},

@@ -86,6 +86,11 @@ except ImportError:  # без customtkinter всё работает, кроме 
     ctk = None
     jarvis_settings = None
 
+try:
+    import jarvis_ai
+except ImportError:
+    jarvis_ai = None
+
 pyautogui.FAILSAFE = False
 
 # ============================================================================
@@ -159,6 +164,19 @@ DEFAULT_CONFIG = {
     # Свои команды (редактируются в окне «открой настройки»):
     # [{"phrase": "блокнот", "target": "notepad.exe"}, {"phrase": "мой сайт", "target": "https://..."}]
     "commands": [],
+    # Нейросеть: «Джарвис, какую игру мне поиграть?». Ключ и провайдера задают в окне настроек (вкладка «Нейросеть»).
+    # provider: gemini | groq | openrouter | custom; пустые base_url/model берутся из пресета провайдера.
+    "ai": {
+        "enabled": False,
+        "provider": "gemini",
+        "api_key": "",
+        "base_url": "",
+        "model": "",
+        "names": ["джарвис", "jarvis"],  # обращение; без слова-активатора нейросеть отвечает только на фразы с именем
+        "city": "Днепр",                 # для вопросов про погоду
+        "max_tokens": 400,
+        "pc_context": True,              # рассказывать нейросети про железо и игры Steam
+    },
 }
 
 # Эти разделы при загрузке ЗАМЕНЯЮТСЯ целиком (а не дополняются значениями по умолчанию) —
@@ -222,6 +240,7 @@ def load_config() -> dict:
         cfg[section] = {_norm(k): v for k, v in cfg[section].items()}
     cfg["phrases"] = {k: _norm(v) for k, v in cfg["phrases"].items()}
     cfg["wake_word"]["word"] = _norm(cfg["wake_word"]["word"])
+    cfg["ai"]["names"] = [_norm(n) for n in cfg["ai"]["names"] if str(n).strip()]
     return cfg
 
 
@@ -244,7 +263,7 @@ def reload_config() -> None:
     STATE.voice_enabled = bool(CFG["voice"]["enabled"])
 
 
-_MERGE_KEYS = ("voice", "wake_word", "chrome")
+_MERGE_KEYS = ("voice", "wake_word", "chrome", "ai")
 
 
 def save_user_config(patch: dict) -> None:
@@ -608,38 +627,125 @@ def _pick_voice(engine):
     return None  # системный голос по умолчанию
 
 
+def _sapi_rate(wpm) -> int:
+    """Слов в минуту (как в pyttsx3, 175 — обычный темп) -> шкала SAPI от -10 до 10."""
+    try:
+        return max(-10, min(10, round((int(wpm) - 175) / 25)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def sapi_voices():
+    import win32com.client
+    sp = win32com.client.Dispatch("SAPI.SpVoice")
+    toks = sp.GetVoices()
+    return sp, [toks.Item(i) for i in range(toks.Count)]
+
+
+def _token_info(tok):
+    desc = tok.GetDescription()
+    try:
+        langs = [x.strip().lower() for x in str(tok.GetAttribute("Language")).split(";")]
+    except Exception:
+        langs = []
+    return desc, langs
+
+
+def pick_sapi_voice(tokens):
+    want = (CFG["voice"]["id"] or "").lower()
+    if want:
+        for t in tokens:
+            if want in f"{t.Id} {t.GetDescription()}".lower():
+                return t
+        print(f"[voice] голос «{want}» не найден — подбираю автоматически (см. --list-voices)")
+    lang = {"ru": "419", "uk": "422", "en": "409"}.get(CFG["language"][:2].lower(), "")
+    for t in tokens:
+        if lang and lang in _token_info(t)[1]:
+            return t
+    if CFG["language"].lower().startswith("ru"):
+        for t in tokens:
+            if any(n in _token_info(t)[0].lower() for n in ("irina", "pavel", "russian")):
+                return t
+    return None  # системный голос по умолчанию
+
+
+def make_sapi():
+    sp, tokens = sapi_voices()
+    tok = pick_sapi_voice(tokens)
+    if tok is not None:
+        sp.Voice = tok
+    sp.Rate = _sapi_rate(CFG["voice"]["rate"])
+    sp.Volume = 100
+    return sp
+
+
+def current_voice_name():
+    try:
+        _sp, tokens = sapi_voices()
+    except Exception:
+        return None
+    tok = pick_sapi_voice(tokens)
+    if tok is not None:
+        return _token_info(tok)[0]
+    return "русский голос не найден, будет системный (Параметры → Время и язык → Речь)"
+
+
 class Speaker:
     """Очередь реплик + один воркер. busy выставляется сразу при постановке в очередь
-    и снимается только когда очередь пуста — Джарвис не слышит сам себя."""
+    и снимается только когда очередь пуста — Джарвис не слышит сам себя.
+
+    Голос — Windows SAPI напрямую (pywin32). pyttsx3 после первой реплики в потоке
+    молчал: его runAndWait() работает один раз, поэтому он оставлен только запасным вариантом."""
 
     def __init__(self):
         self.q: queue.Queue = queue.Queue()
         self.busy = threading.Event()
-        if pyttsx3 is not None:
-            threading.Thread(target=self._run, daemon=True).start()
+        threading.Thread(target=self._run, daemon=True).start()
 
     def say(self, text: str) -> None:
+        text = (text or "").strip()
+        if text:
+            self.busy.set()
+            self.q.put(text)
+
+    @staticmethod
+    def _speak_pyttsx3(text: str) -> None:
         if pyttsx3 is None:
-            return
-        self.busy.set()
-        self.q.put(text)
+            raise RuntimeError("pyttsx3 не установлен")
+        engine = pyttsx3.init()  # каждый раз новый движок: переиспользованный молчит
+        vid = _pick_voice(engine)
+        if vid:
+            engine.setProperty("voice", vid)
+        engine.setProperty("rate", CFG["voice"]["rate"])
+        engine.say(text)
+        engine.runAndWait()
+        engine.stop()
 
     def _run(self) -> None:
-        engine = None
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()  # COM нужно инициализировать в том потоке, где говорим
+        except Exception as e:
+            log_error("COM", e)
+        sapi, sig, fails = None, None, 0
         while True:
             text = self.q.get()
             try:
-                if engine is None:
-                    engine = pyttsx3.init()
-                    vid = _pick_voice(engine)
-                    if vid:
-                        engine.setProperty("voice", vid)
-                    engine.setProperty("rate", CFG["voice"]["rate"])
-                engine.say(text)
-                engine.runAndWait()
+                cur = (CFG["voice"]["id"], CFG["voice"]["rate"])
+                if sapi is None or cur != sig:  # голос или скорость поменяли в настройках
+                    sapi, sig = make_sapi(), cur
+                sapi.Speak(text, 0)  # 0 = дождаться конца фразы
+                fails = 0
             except Exception as e:
-                log_error("Озвучка", e)
-                engine = None
+                log_error("Озвучка (SAPI)", e)
+                sapi = None
+                fails += 1
+                try:
+                    self._speak_pyttsx3(text)
+                except Exception as e2:
+                    log_error("Озвучка (pyttsx3)", e2)
+                    if fails == 3 and notifier:
+                        notifier.show("Голос не работает. Подробности в errors.log", False, 5000)
             if self.q.empty():
                 time.sleep(0.4)  # даём эху затихнуть
                 if self.q.empty():
@@ -662,7 +768,7 @@ speaker: Speaker | None = None
 def notify(message: str, ok: bool = True, force_speak: bool = False) -> None:
     print(("[ok] " if ok else "[!!] ") + message)
     if notifier:
-        notifier.show(message, ok)
+        notifier.show(message, ok, max(2000, min(15000, 60 * len(message))))  # длинные ответы показываем дольше
     if speaker and (STATE.voice_enabled or force_speak):
         speaker.say(message)
 
@@ -942,6 +1048,10 @@ def is_word(text: str, *words: str) -> bool:
     return any(re.search(r"\b" + re.escape(w) + r"\b", text) for w in words)
 
 
+def is_help(t: str) -> bool:
+    return "что ты умеешь" in t or "список команд" in t or t.strip() == "помощь"
+
+
 def is_pc(text: str) -> bool:
     return is_word(text, "пк", "комп", "компьютер", "компьютера", "ноутбук")
 
@@ -960,6 +1070,7 @@ def commands_text() -> str:
 — песня — нажать play/pause в YouTube Music
 — включи/поставь/найди трек <название> — найти и включить трек
 — загугли <запрос> / найди <запрос> — поиск в Google (в Chrome)
+— «Джарвис, <вопрос>» — ответ нейросети голосом (нужен ключ: настройки → Нейросеть)
 — геншин; майнкрафт; призм; роблокс — запуск игр и лаунчеров
 — игры Steam: {", ".join(sorted(CFG["games"]))}
 — стим / дискорд / телеграм (+ «закрой …») — запуск и закрытие
@@ -978,9 +1089,17 @@ def commands_text() -> str:
 {chr(10).join("— " + c["phrase"] + " → " + c["target"] for c in CFG["commands"]) or "— пока нет (добавь в настройках)"}"""
 
 
+def hard_exit(delay: float = 12.0) -> None:
+    """Страховка: если что-то (микрофон, озвучка, окно) зависло при выходе — убиваем процесс."""
+    timer = threading.Timer(delay, lambda: os._exit(0))
+    timer.daemon = True
+    timer.start()
+
+
 def cmd_exit(t):
     notify("Выход из программы.")
     STATE.stop.set()
+    hard_exit()
 
 
 def cmd_shutdown(t):
@@ -1049,6 +1168,52 @@ def cmd_search(t):
         notify("Не расслышал, что искать.", ok=False)
         return
     open_url("https://www.google.com/search?q=" + quote_plus(query), f"поиск «{query}»")
+
+
+# ----- нейросеть --------------------------------------------------------------
+
+def ai_context() -> dict:
+    launchers = [name for name, finder in (
+        ("Genshin Impact", find_genshin), ("Minecraft", find_minecraft), ("Prism Launcher", find_prism),
+        ("Discord", discord_command), ("Telegram", find_telegram)) if finder()]
+    return {"mode": "игровой" if STATE.playing else "учебный", "steam_exe": find_steam(),
+            "launchers": launchers, "known_games": sorted(CFG["games"])}
+
+
+ASSISTANT = jarvis_ai.Assistant(lambda: CFG["ai"], ai_context) if jarvis_ai else None
+
+
+def ai_ready() -> bool:
+    return ASSISTANT is not None and bool(CFG["ai"]["enabled"])
+
+
+def ai_question(text: str) -> str:
+    """Фраза без обращения к Джарвису."""
+    for n in CFG["ai"]["names"]:
+        text = text.replace(n, " ")
+    return re.sub(r"\s+", " ", text).strip(" ,.!?-—")
+
+
+def ask_ai(question: str) -> None:
+    print(f"[ai] вопрос: {question}")
+    if not ASSISTANT.lock.acquire(blocking=False):
+        notify("Подожди, я ещё отвечаю на прошлый вопрос.", ok=False)
+        return
+
+    def worker():
+        try:
+            if notifier:
+                notifier.show("Думаю…", True, 1500)
+            notify(ASSISTANT.ask(question))  # ответ уходит и во всплывашку, и в голос
+        except jarvis_ai.AIError as e:
+            notify(str(e), ok=False)
+        except Exception as e:
+            log_error("Нейросеть", e)
+            notify("Нейросеть сейчас недоступна.", ok=False)
+        finally:
+            ASSISTANT.lock.release()
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def cmd_genshin(t):
@@ -1157,7 +1322,9 @@ def cmd_settings(t):
         notify("Для окна настроек нужен customtkinter:  pip install customtkinter", ok=False)
         return
     notify("Открываю настройки.")
-    notifier.call(lambda root: jarvis_settings.open_settings(root, CFG, save_user_config, AUTOSTART))
+    notifier.call(lambda root: jarvis_settings.open_settings(
+        root, CFG, save_user_config, AUTOSTART, jarvis_ai,
+        say=lambda text: speaker.say(text) if speaker else None))
 
 
 def U(key):  # ссылка из config.urls
@@ -1178,7 +1345,7 @@ COMMANDS = [
     Cmd(lambda t: has(t, "выключ") and is_pc(t), cmd_shutdown, True),
     Cmd(lambda t: has(t, "перезагруз") and is_pc(t), cmd_restart, True),
     Cmd(lambda t: has(t, "запиш", "заметк"), cmd_note, False),
-    Cmd(lambda t: "что ты умеешь" in t or "список команд" in t or t.strip() == "помощь", cmd_help, False),
+    Cmd(is_help, cmd_help, False),
     Cmd(lambda t: is_word(t, "голос"), cmd_voice, False),
     Cmd(lambda t: bool(TRACK_RE.search(t)), cmd_track, False),  # раньше «музык» и «песн»
     Cmd(lambda t: has(t, "музык") and CLOSE(t), lambda t: close_music_windows(), False),
@@ -1223,6 +1390,10 @@ def process(text: str) -> None:
             return
         text = text.replace(wake["word"], "", 1).strip()
 
+    # Обращение к Джарвису: слово-активатор уже проверено выше, иначе ищем имя в фразе
+    addressed = bool(wake["enabled"]) or any(n in text for n in CFG["ai"]["names"])
+    ask = ai_question(text) if addressed and ai_ready() else None
+
     if P["pause"] in text:
         STATE.listening = False
         notify(f"Джарвис на паузе. Скажите «{P['resume']}», чтобы возобновить.")
@@ -1236,6 +1407,11 @@ def process(text: str) -> None:
         notify("Включаю игровой режим.")
         return
 
+    # вопрос («какая погода», «что поиграть») — сразу нейросети, а не по списку команд
+    if ask and jarvis_ai.is_question(ask) and not is_help(ask):
+        ask_ai(ask)
+        return
+
     for cmd in COMMANDS:
         if cmd.match(text):
             if cmd.play_only and not STATE.playing:
@@ -1243,6 +1419,11 @@ def process(text: str) -> None:
             else:
                 cmd.run(text)
             return
+
+    if ask:  # обратились по имени, но это не команда — пусть ответит нейросеть
+        ask_ai(ask)
+    elif addressed and jarvis_ai and not CFG["ai"]["enabled"] and jarvis_ai.is_question(ai_question(text)):
+        notify("Нейросеть выключена. Включи её в настройках, вкладка «Нейросеть», и нажми «Сохранить».", ok=False)
 
 
 # ============================================================================
@@ -1321,7 +1502,10 @@ def print_check() -> None:
         ("Genshin Impact", f"задача {CFG['genshin_task']}" if CFG["genshin_task"] else find_genshin()),
         ("Minecraft Launcher", find_minecraft()),
         ("Prism Launcher", find_prism()),
-        ("Голос TTS", "pyttsx3 установлен" if pyttsx3 else None),
+        ("Голос (SAPI)", current_voice_name()),
+        ("Голос (запасной pyttsx3)", "установлен" if pyttsx3 else None),
+        ("Нейросеть", (f"{CFG['ai']['provider']}, ключ {'задан' if jarvis_ai and jarvis_ai.resolve(CFG['ai'])[2] else 'НЕ задан'}"
+                       if CFG["ai"]["enabled"] else "выключена (настройки → Нейросеть)") if jarvis_ai else None),
         ("ytmusicapi", "установлен" if YTMusic else None),
         ("Папка данных", str(DATA_DIR)),
     ]
@@ -1333,11 +1517,37 @@ def print_check() -> None:
 
 
 def list_voices() -> None:
-    if pyttsx3 is None:
-        print("pyttsx3 не установлен")
+    try:
+        _sp, tokens = sapi_voices()
+    except Exception as e:
+        print(f"SAPI недоступен: {e}")
         return
-    for v in pyttsx3.init().getProperty("voices"):
-        print(f"{v.name}\n   id: {v.id}")
+    for t in tokens:
+        desc, langs = _token_info(t)
+        print(f"{desc}  [языки: {', '.join(langs) or '?'}]\n   id: {t.Id}")
+    if not tokens:
+        print("Голосов нет. Добавь голос: Параметры → Время и язык → Речь.")
+
+
+def say_test(text: str) -> None:
+    """jarvis.py --say "текст": проверка голоса. Ошибки озвучки пишутся в errors.log."""
+    sp = Speaker()
+    sp.say(text)
+    time.sleep(0.3)
+    while sp.busy.is_set():
+        time.sleep(0.1)
+    print(f"Готово. Если звука не было, смотри {ERROR_LOG}")
+
+
+def ask_test(question: str) -> None:
+    """jarvis.py --ask "вопрос": спросить нейросеть из консоли, без микрофона и голоса."""
+    if ASSISTANT is None:
+        print("Модуль jarvis_ai не найден.")
+        return
+    try:
+        print(ASSISTANT.ask(_norm(question)))
+    except jarvis_ai.AIError as e:
+        print(f"[!!] {e}")
 
 
 def main() -> None:
@@ -1345,12 +1555,20 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Джарвис — голосовой ассистент")
     ap.add_argument("--check", action="store_true", help="показать, что найдено на этом ПК")
     ap.add_argument("--list-voices", action="store_true", help="список голосов TTS")
+    ap.add_argument("--say", metavar="ТЕКСТ", help="проверить голос: произнести текст")
+    ap.add_argument("--ask", metavar="ВОПРОС", help="спросить нейросеть (нужен ключ в настройках)")
     args = ap.parse_args()
     if args.check:
         print_check()
         return
     if args.list_voices:
         list_voices()
+        return
+    if args.say:
+        say_test(args.say)
+        return
+    if args.ask:
+        ask_test(args.ask)
         return
 
     if not single_instance():
@@ -1378,6 +1596,10 @@ def main() -> None:
             time.sleep(0.1)
             waited += 0.1
         notifier.close()
+        stuck = [t.name for t in threading.enumerate() if t is not threading.main_thread() and not t.daemon]
+        if stuck:  # такие потоки не дают процессу завершиться — пишем в лог, чтобы найти причину
+            log_error("Выход", RuntimeError(f"не завершились потоки: {stuck}"))
+        os._exit(0)  # без этого процесс мог остаться висеть в фоне, хотя Джарвис уже не слушает
 
 
 if __name__ == "__main__":
