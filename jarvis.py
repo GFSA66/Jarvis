@@ -28,7 +28,7 @@ import time
 import traceback
 import webbrowser
 from collections import namedtuple
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -104,6 +104,7 @@ APP_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).re
 DATA_DIR = Path(os.environ.get("JARVIS_HOME") or (Path.home() / ".jarvis"))
 NOTES_PATH = DATA_DIR / "notes.txt"
 ERROR_LOG = DATA_DIR / "errors.log"
+HISTORY_PATH = DATA_DIR / "history.jsonl"  # история запросов к Джарвису
 
 YT_MUSIC_URL = "https://music.youtube.com"
 YT_MUSIC_WINDOW_TITLE = "YouTube Music"
@@ -174,9 +175,17 @@ DEFAULT_CONFIG = {
         "model": "",
         "names": ["джарвис", "jarvis"],  # обращение; без слова-активатора нейросеть отвечает только на фразы с именем
         "city": "Днепр",                 # для вопросов про погоду
+        "user_name": "сэр",              # как Джарвис обращается к пользователю голосом
+        "style": "film",                 # характер ответов: film — как в кино, dry — сухо, brief — кратко
         "max_tokens": 400,
         "pc_context": True,              # рассказывать нейросети про железо и игры Steam
+        "files": True,                   # доступ к файлам ПК: чтение, создание, редактирование
+        "self_edit": True,               # нейросеть может редактировать файлы самого Джарвиса
+        "chat": {"attention_sec": 25, "history_turns": 6},  # диалог: сколько секунд помнить обращение без имени
     },
+    # История запросов к Джарвису: %USERPROFILE%\.jarvis\history.jsonl
+    # (команды «история запросов» и «очисти историю»)
+    "history": {"enabled": True, "max": 300},
 }
 
 # Эти разделы при загрузке ЗАМЕНЯЮТСЯ целиком (а не дополняются значениями по умолчанию) —
@@ -241,6 +250,20 @@ def load_config() -> dict:
     cfg["phrases"] = {k: _norm(v) for k, v in cfg["phrases"].items()}
     cfg["wake_word"]["word"] = _norm(cfg["wake_word"]["word"])
     cfg["ai"]["names"] = [_norm(n) for n in cfg["ai"]["names"] if str(n).strip()]
+    cfg["ai"]["user_name"] = str(cfg["ai"].get("user_name") or "сэр").strip()
+    if cfg["ai"].get("style") not in ("film", "dry", "brief"):
+        cfg["ai"]["style"] = "film"
+    chat = cfg["ai"].get("chat") or {}
+    try:
+        attention = float(chat.get("attention_sec", 25))
+    except (TypeError, ValueError):
+        attention = 25.0
+    try:
+        turns = int(chat.get("history_turns", 6))
+    except (TypeError, ValueError):
+        turns = 6
+    cfg["ai"]["chat"] = {"attention_sec": max(0.0, attention),
+                         "history_turns": min(12, max(1, turns))}
     return cfg
 
 
@@ -758,6 +781,7 @@ class State:
         self.playing = True  # игровой режим (False — учебный)
         self.voice_enabled = bool(CFG["voice"]["enabled"])
         self.stop = threading.Event()
+        self.attention_until = 0.0  # до этого момента Джарвис «держит внимание» — имя можно не называть
 
 
 STATE = State()
@@ -765,12 +789,19 @@ notifier: Notifier | None = None
 speaker: Speaker | None = None
 
 
+def speakable(message: str) -> str:
+    """Текст для голоса: без полных путей и адресов — их неинтересно слушать."""
+    text = re.sub(r"https?://\S+", "", message)
+    text = re.sub(r"[A-Za-z]:[\\/]\S+|\\\\\S+", "", message)
+    return re.sub(r"\s{2,}", " ", text).strip(" \n\t:-,.")
+
+
 def notify(message: str, ok: bool = True, force_speak: bool = False) -> None:
-    print(("[ok] " if ok else "[!!] ") + message)
+    print((("[ok] " if ok else "[!!] ") + message))
     if notifier:
         notifier.show(message, ok, max(2000, min(15000, 60 * len(message))))  # длинные ответы показываем дольше
     if speaker and (STATE.voice_enabled or force_speak):
-        speaker.say(message)
+        speaker.say(speakable(message))
 
 
 # ============================================================================
@@ -1056,6 +1087,21 @@ def is_pc(text: str) -> bool:
     return is_word(text, "пк", "комп", "компьютер", "компьютера", "ноутбук")
 
 
+# Разделители цепочки команд: «открой стим и заметки», «запусти майнкрафт, потом музыку»
+CHAIN_SPLIT_RE = re.compile(r"\s*(?:,|\bи\b|\bа\s+также\b|\bпотом\b|\bзатем\b|\bпосле\s+этого\b|\s*\+\s*)\s*")
+
+
+def split_chain(text: str) -> list:
+    """Фразу «открой стим и заметки» -> [«открой стим», «заметки»].
+    Пустые куски выбрасываем. Делим осторожно: «создай …» с « и » внутри не трогаем,
+    чтобы не развалить «создай папку моды и в ней файл список»."""
+    stripped = text.strip()
+    if parse_create(stripped) is not None:
+        return [stripped]
+    parts = [p.strip(" ,.!?-—") for p in CHAIN_SPLIT_RE.split(stripped)]
+    return [p for p in parts if p]
+
+
 TRACK_RE = re.compile(r"\b(?:включи|поставь|найди)\s+(?:трек|песню|песня)\s+(.+)")
 # «загугли X», «найди X», «найди в интернете X» (но «найди трек X» — это музыка, см. TRACK_RE)
 SEARCH_RE = re.compile(
@@ -1070,7 +1116,13 @@ def commands_text() -> str:
 — песня — нажать play/pause в YouTube Music
 — включи/поставь/найди трек <название> — найти и включить трек
 — загугли <запрос> / найди <запрос> — поиск в Google (в Chrome)
-— «Джарвис, <вопрос>» — ответ нейросети голосом (нужен ключ: настройки → Нейросеть)
+— «Джарвис, <вопрос>» — ответ нейросети голосом (нужен ключ: настройки → Нейросеть);
+  нейросеть умеет читать, создавать и редактировать файлы на ПК и саму себя
+— говорить можно подряд: после обращения Джарвис держит внимание 25 с (настройки → Нейросеть);
+  помнит последние реплики («это норма?» понимает по прошлому ответу);
+  несколько команд сразу: «открой стим и заметки», «запусти майнкрафт, потом музыку»;
+  «забудь разговор» / «новый разговор» — начать заново
+— история запросов — последние запросы к Джарвису; очисти историю — удалить их ({HISTORY_PATH})
 — геншин; майнкрафт; призм; роблокс — запуск игр и лаунчеров
 — игры Steam: {", ".join(sorted(CFG["games"]))}
 — стим / дискорд / телеграм (+ «закрой …») — запуск и закрытие
@@ -1078,7 +1130,14 @@ def commands_text() -> str:
 — логика — backoffice Logika; фильм / кино; аниме; гитхаб; комплектующие
 — закрой браузер — закрыть все окна Chrome
 — открой <сайт> — сайт из списка: {", ".join(sorted(CFG["sites"]))}
-— запиши <текст> / заметка <текст> — сохранить заметку ({NOTES_PATH})
+— запиши <текст> / заметка <текст> — сохранить заметку; открой заметки — показать; очисти заметки — удалить все ({NOTES_PATH})
+— создай файл <имя> / создай папку <имя> / создай папку <имя> и в ней файл <имя> — по умолчанию на рабочем столе
+— напомни <что> через 10 минут / в 20:00 / каждый день в 9:00 — голосовое напоминание;
+  напоминания — показать список, очисти напоминания — удалить все
+— «Джарвис, какая температура процессора?» — датчики ПК; «это норма?» — оценка по предыдущему ответу
+— «Джарвис, где файлы из колледжа» — поиск по всему ПК; «открой папку с фотографиями» — откроется Проводник
+— «Джарвис, установи wukong» — установка игры из Steam; после этого «запусти вуконг» работает голосом
+— «напечатай …» — набор текста в активном окне
 — выключи / перезагрузи пк — через {CFG["shutdown_delay_sec"]} с; «отмена» — отменить
 — голос — вкл/выкл голосовые ответы
 — открой настройки — окно настроек (свои команды, игры, ссылки, пути, автозапуск)
@@ -1125,6 +1184,29 @@ def cmd_cancel_shutdown(t):
         notify("Нечего отменять.", ok=False)
 
 
+def cmd_notes(t):
+    """«открой/покажи заметки», «очисти/удали заметки»."""
+    if has(t, "очист", "удали", "удалит", "сотр", "стереть", "стер", "сброс", "удалить"):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            if NOTES_PATH.exists():
+                NOTES_PATH.unlink()
+        except OSError as e:
+            notify(f"Не смог очистить заметки: {e}", ok=False)
+            return
+        notify("Все заметки удалены.")
+        return
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if not NOTES_PATH.exists():
+            NOTES_PATH.write_text("", encoding="utf-8")
+        os.startfile(str(NOTES_PATH))
+    except OSError as e:
+        notify(f"Не смог открыть заметки: {e}", ok=False)
+        return
+    notify("Открыл заметки.")
+
+
 def cmd_note(t):
     m = re.search(r"\b(?:запиш\w*|заметк\w*)\s*(.*)", t)
     note = (m.group(1) if m else "").strip()
@@ -1135,6 +1217,384 @@ def cmd_note(t):
     with open(NOTES_PATH, "a", encoding="utf-8") as f:
         f.write(f"[{datetime.now():%Y-%m-%d %H:%M}] {note}\n")
     notify(f"Записал: {note}")
+
+
+# ----- знакомые папки и создание файлов/папок -------------------------------
+
+@lru_cache(None)
+def user_folders() -> dict:
+    """«рабочий стол» -> реальный путь. Берём из реестра (учитывает OneDrive и перенос папок)."""
+    key = r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+    want = {"рабочий стол": "Desktop", "документы": "Personal", "изображения": "My Pictures",
+            "музыка": "My Music", "видео": "My Video",
+            "загрузки": "{374DE290-123F-4565-9164-39C4925E467B}"}
+    out: dict = {}
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
+            for ru, val in want.items():
+                raw, _ = winreg.QueryValueEx(k, val)
+                out[ru] = str(Path(os.path.expandvars(str(raw))))
+    except OSError:
+        pass
+    for ru, sub in (("рабочий стол", "Desktop"), ("документы", "Documents"), ("загрузки", "Downloads"),
+                    ("изображения", "Pictures"), ("музыка", "Music"), ("видео", "Videos")):
+        out.setdefault(ru, str(Path.home() / sub))
+    return out
+
+
+_FOLDER_STEMS = (("стол", "рабочий стол"), ("загруз", "загрузки"), ("документ", "документы"),
+                 ("фото", "изображения"), ("изображен", "изображения"), ("картин", "изображения"),
+                 ("музык", "музыка"), ("видео", "видео"))
+
+
+def _create_dest(t: str) -> Path:
+    """Куда создавать: место из фразы («на рабочем столе», «в загрузках»), иначе рабочий стол."""
+    folders = user_folders()
+    for stem, key in _FOLDER_STEMS:
+        if stem in t:
+            return Path(folders.get(key) or (Path.home() / "Desktop"))
+    return Path(folders.get("рабочий стол") or (Path.home() / "Desktop"))
+
+
+def parse_create(t: str):
+    """«создай файл отчёт», «создай папку игры», «создай папку моды и вней файл список»
+    -> (список папок, файл|None, путь назначения) или None, если фраза не про создание."""
+    if not re.search(r"\b(?:файл|папк\w*|директори\w*|каталог\w*)", t):
+        return None
+    if not (re.search(r"\b(?:созда\w+|сдела\w+|заведи|нов\w*)\b", t)):
+        return None
+    stop = r"(?=\s+(?:и|в|на|внутри|для|пожалуйста|с\s+текстом|там)\b|$|[.,!?])"
+    m_dir = re.search(r"\b(?:папку|папка|папке|папки|директорию|каталог)\s+(?:с\s+именем\s+)?(.+?)"
+                      + stop, t)
+    m_file = re.search(r"\bфайл\w*\s+(?:с\s+именем\s+|под\s+названием\s+)?(.+?)" + stop, t)
+    if not m_dir and not m_file:
+        return None
+    dirs = [m_dir.group(1).strip().strip("\"'«»") ] if m_dir else []
+    fname = m_file.group(1).strip().strip("\"'«»") if m_file else None
+    # имя файла из мусора речи («файл список для меня») и расширение по умолчанию
+    if fname:
+        fname = re.sub(r"\b(пожалуйста|для меня|у меня|новый|новая)\b", "", fname).strip()
+        if fname and "." not in fname:
+            fname += ".txt"
+        if not fname:
+            fname = None
+    dirs = [c for d in dirs for c in [re.sub(r"\b(пожалуйста|для меня|с именем)\b", "", d).strip()] if c]
+
+    def _is_place(s: str) -> bool:
+        # «в загрузках», «на рабочем столе» — это место, а не имя
+        return bool(s) and bool(re.match(r"^(?:в|на)\s", s)) and any(st in s for st, _ in _FOLDER_STEMS)
+
+    if dirs and _is_place(dirs[0]):
+        dirs = []
+    if fname and _is_place(fname):
+        fname = None
+    if not dirs and not fname:
+        return None
+    return dirs, fname, _create_dest(t)
+
+
+# ----- открытие файлов и папок ----------------------------------------------
+
+_OPEN_ITEM = re.compile(r"\b(?:файл\w*|папк\w*|документ\w*|директори\w*|каталог\w*|изображени\w*|"
+                        r"картин\w*|фото|текст\w*)\b")
+_OPEN_PATH = re.compile(r"(?:[a-zA-Z]:[\\/]|~[\\/]|\\\\)[\w .\\/-]+")
+
+
+def wants_open_item(t: str) -> bool:
+    """«открой файл отчёт», «открой папку с фото» — это файл, а не сайт из списка."""
+    if not re.search(r"\bоткр\w+", t):
+        return False
+    return bool(_OPEN_ITEM.search(t) or _OPEN_PATH.search(t))
+
+
+def cmd_open(t):
+    m = _OPEN_PATH.search(t)
+    if m:
+        p = Path(os.path.expandvars(os.path.expanduser(m.group(0).strip().strip("\"'"))))
+        if p.exists():
+            try:
+                os.startfile(str(p))
+                notify(f"Открыл: {p}")
+                return
+            except OSError as e:
+                log_error("Открытие файла", e)
+    if ai_ready():
+        ask_ai(ai_question(t) or t)  # нейросеть найдёт по имени (find_any) и откроет (open_path)
+    else:
+        notify("Не понял, какой файл открыть. Назови точный путь либо включи нейросеть в настройках, "
+               "вкладка «Нейросеть» — она найдёт файл сама.", ok=False)
+
+
+def cmd_create(t):
+    plan = parse_create(t)
+    if not plan:
+        return
+    dirs, fname, dest = plan
+    what, made = [], []
+    base = dest
+    for d in dirs:
+        p = base / d
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            made.append(str(p))
+            what.append(f"папку «{d}»")
+            base = p  # «и в ней файл» — файл кладём внутрь созданной папки
+        except OSError as e:
+            log_error("Создание папки", e)
+            notify(f"Не удалось создать папку «{d}».", ok=False)
+            return
+    if fname:
+        p = base / fname
+        if p.exists():
+            notify(f"Файл «{fname}» уже есть: {p}", ok=False)
+            return
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("", encoding="utf-8")
+            made.append(str(p))
+            what.append(f"файл «{fname}»")
+        except OSError as e:
+            log_error("Создание файла", e)
+            notify(f"Не удалось создать файл «{fname}».", ok=False)
+            return
+    place = next((f"{k}" for stem, k in _FOLDER_STEMS if stem in t), "рабочий стол")
+    place_txt = {"рабочий стол": "на рабочем столе", "загрузки": "в загрузках", "документы": "в документах",
+                 "изображения": "в изображениях", "музыка": "в музыке", "видео": "в видео"}.get(place, f"в папке {place}")
+    notify(f"Создал {' и '.join(what)} {place_txt}. {' '.join(made)}")
+
+
+# ----- история запросов --------------------------------------------------------
+
+def history_add(kind: str, question: str, answer: str, tools=None) -> None:
+    """Одна строка истории в JSONL-журнале запросов (~/.jarvis/history.jsonl)."""
+    if not CFG.get("history", {}).get("enabled", True):
+        return
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        rec = {"time": f"{datetime.now():%Y-%m-%d %H:%M:%S}", "type": kind,
+               "question": str(question), "answer": str(answer)}
+        if tools:
+            rec["tools"] = list(tools)
+        with open(HISTORY_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        _history_trim()
+    except Exception as e:  # история не должна ломать основную задачу
+        log_error("История запросов", e)
+
+
+def _history_trim() -> None:
+    """Не даём истории расти бесконечно."""
+    limit = int(CFG.get("history", {}).get("max") or 300)
+    try:
+        lines = HISTORY_PATH.read_text(encoding="utf-8").splitlines()
+        if len(lines) > limit:
+            HISTORY_PATH.write_text("\n".join(lines[-limit:]) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def history_lines(limit: int = 20) -> list:
+    """Последние записи истории (старые — в начале списка)."""
+    try:
+        rows = [json.loads(s) for s in HISTORY_PATH.read_text(encoding="utf-8").splitlines() if s.strip()]
+    except (OSError, ValueError):
+        return []
+    return rows[-limit:]
+
+
+def history_text(limit: int = 20) -> str:
+    rows = history_lines(limit)
+    if not rows:
+        return "История запросов пуста."
+    out = []
+    for r in reversed(rows):  # новые сверху
+        line = f"{r.get('time', '')}  [{r.get('type', '')}] {r.get('question', '')}\n    → {r.get('answer', '')}"
+        if r.get("tools"):
+            line += f"\n    (файлы: {', '.join(r['tools'])})"
+        out.append(line)
+    return f"Последние запросы к Джарвису (новые сверху, всего в файле: {HISTORY_PATH}):\n\n" + "\n\n".join(out)
+
+
+def cmd_history(t):
+    if is_word(t, "очисти", "очистить", "удали", "удалить", "сбрось"):
+        try:
+            HISTORY_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+        notify("История запросов очищена.")
+        return
+    if not history_lines(1):
+        notify("История запросов пока пуста.")
+        return
+    text = history_text(20)
+    # всегда пишем читаемый файл и открываем его: так история видна и без консоли,
+    # и когда Джарвис запущен из терминала
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path = DATA_DIR / "history.txt"
+    try:
+        path.write_text(text, encoding="utf-8")
+        os.startfile(str(path))  # откроется в Блокноте (или ассоциированной программе)
+        notify(f"История запросов открыта: {path}")
+    except OSError as e:
+        log_error("Открытие истории", e)
+        print(text)  # файл открыть не удалось — хотя бы в консоль
+        notify(f"Не удалось открыть файл, история выведена в консоль. Файл: {path}", ok=False)
+
+
+# ----- напоминания ------------------------------------------------------------
+
+REMINDERS_PATH = DATA_DIR / "reminders.json"
+
+
+def reminders_load() -> list:
+    try:
+        rows = json.loads(REMINDERS_PATH.read_text(encoding="utf-8"))
+        return rows if isinstance(rows, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def reminders_save(rows: list) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = REMINDERS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, REMINDERS_PATH)
+    except OSError as e:
+        log_error("Напоминания", e)
+
+
+def reminder_add(text: str, at: str, daily: bool = False) -> dict:
+    """at: «ГГГГ-ММ-ДД ЧЧ:ММ» (разовое) или «ЧЧ:ММ» (ежедневное)."""
+    rows = reminders_load()
+    row = {"text": str(text).strip(), "at": str(at).strip(), "daily": bool(daily),
+           "created": f"{datetime.now():%Y-%m-%d %H:%M}"}
+    rows.append(row)
+    reminders_save(rows)
+    return row
+
+
+def parse_reminder(t: str):
+    """«напомни мне забрать дейлики через 10 минут», «в 20:00 выключи зарядку»,
+    «каждый день в 9:00 напомни позвонить» -> (о чём, at, каждый день?) или None."""
+    if not re.search(r"\b(?:напомни|напомнить)\b", t):
+        return None
+    body = re.sub(r"\b(?:напомни|напомнить)(?:\s+мне)?\b", " ", t)
+    at, daily = None, False
+
+    md = re.search(r"\b(?:каждый день|ежедневно)\s+(?:в\s+)?(\d{1,2})[:.](\d{2})\b", body)
+    if md:
+        daily, at = True, f"{int(md.group(1)):02d}:{md.group(2)}"
+        body = (body[:md.start()] + " " + body[md.end():]).strip()
+
+    if at is None:
+        mc = re.search(r"\bчерез\s+(\d+)\s*(секунд\w*|сек|минут\w*|мин|час\w*|ч)\b", body)
+        if mc:
+            n, unit = int(mc.group(1)), mc.group(2)
+            delta = (timedelta(seconds=n) if unit.startswith("сек")
+                     else timedelta(minutes=n) if unit.startswith(("мин", "м"))
+                     else timedelta(hours=n))
+            at = (datetime.now() + delta).strftime("%Y-%m-%d %H:%M")
+            body = (body[:mc.start()] + " " + body[mc.end():]).strip()
+
+    if at is None:
+        mt = re.search(r"\b(?:сегодня|завтра)?\s*в\s+(\d{1,2})[:.](\d{2})\b", body)
+        if mt:
+            when = datetime.now().replace(hour=int(mt.group(1)), minute=int(mt.group(2)),
+                                          second=0, microsecond=0)
+            if "завтра" in body[:mt.start()].lower():
+                when += timedelta(days=1)
+            elif when <= datetime.now():
+                when += timedelta(days=1)  # время уже прошло — на завтра
+            at = when.strftime("%Y-%m-%d %H:%M")
+            body = (body[:mt.start()] + " " + body[mt.end():]).strip()
+
+    if at is None:
+        return None
+    body = re.sub(r"\b(пожалуйста|мне|напомни|напомнить|сегодня|завтра|чтобы|нужно|про)\b", "", body)
+    body = re.sub(r"\s{2,}", " ", body).strip(" ,.!?\t")
+    return (body, at, daily) if body else None
+
+
+def reminders_text() -> str:
+    rows = reminders_load()
+    if not rows:
+        return ""
+    out = [f"— {r.get('text')} ({'каждый день в ' if r.get('daily') else ''}{r.get('at')})"
+           for r in sorted(rows, key=lambda r: str(r.get("at")))]
+    return "Напоминания:\n" + "\n".join(out)
+
+
+def _fire_reminder(text: str) -> None:
+    print(f"[напоминание] {text}")
+    notify(f"Напоминание: {text}", force_speak=True)
+    history_add("напоминание", "напоминание", text)
+
+
+def reminders_loop() -> None:
+    """Фоновая проверка каждые 10 секунд: разовые срабатывают и удаляются, ежедневные — раз в день."""
+    while not STATE.stop.is_set():
+        time.sleep(10)
+        try:
+            now = datetime.now()
+            rows = reminders_load()
+            if not rows:
+                continue
+            changed = False
+            for r in list(rows):
+                text, at = str(r.get("text") or ""), str(r.get("at") or "")
+                if r.get("daily"):
+                    try:
+                        hh, mm = map(int, at.split(":"))
+                    except ValueError:
+                        continue
+                    due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                    if now >= due and r.get("last") != f"{now:%Y-%m-%d}":
+                        r["last"] = f"{now:%Y-%m-%d}"
+                        changed = True
+                        _fire_reminder(text)
+                else:
+                    try:
+                        due = datetime.strptime(at, "%Y-%m-%d %H:%M")
+                    except ValueError:
+                        continue
+                    if now >= due:
+                        rows.remove(r)
+                        changed = True
+                        _fire_reminder(text)
+            if changed:
+                reminders_save(rows)
+        except Exception as e:  # noqa: BLE001
+            log_error("Напоминания", e)
+
+
+def cmd_reminders(t):
+    if is_word(t, "удали", "удалить", "очисти", "очистить", "сбрось", "отмени", "отменить", "убери"):
+        reminders_save([])
+        notify("Все напоминания удалены.")
+        return
+    txt = reminders_text()
+    if not txt:
+        notify("Напоминаний нет.")
+        return
+    show_text("reminders.txt", txt)
+    notify("Показал напоминания." if len(txt) < 200 else txt)
+
+
+def cmd_remind(t):
+    plan = parse_reminder(t)
+    if not plan:
+        if ai_ready():
+            ask_ai(ai_question(t) or t)  # время поняла только нейросеть (add_reminder)
+        else:
+            notify("Скажи, когда: «напомни через 10 минут …», «напомни в 20:00 …» или "
+                   "«каждый день в 9:00 …».", ok=False)
+        return
+    text, at, daily = plan
+    reminder_add(text, at, daily)
+    when = f"каждый день в {at}" if daily else at
+    notify(f"Хорошо, напомню: {text} — {when}.")
+    history_add("напоминание", t, f"поставлено: {text} ({when})")
 
 
 def show_text(name: str, text: str) -> None:
@@ -1157,6 +1617,14 @@ def cmd_voice(t):
     notify(f"Голосовой вывод {'включён' if STATE.voice_enabled else 'выключен'}.", force_speak=True)
 
 
+def cmd_forget(t):
+    """«забудь разговор» / «новый разговор» — стереть память диалога у нейросети."""
+    if ASSISTANT is not None:
+        ASSISTANT.forget()
+    STATE.attention_until = 0.0
+    notify("Забыл разговор. Начнём заново?")
+
+
 def cmd_track(t):
     m = TRACK_RE.search(t)
     play_track(m.group(1).strip())
@@ -1172,15 +1640,132 @@ def cmd_search(t):
 
 # ----- нейросеть --------------------------------------------------------------
 
+def _self_files() -> list:
+    """Свои исходники: рядом с программой (git/разработка) либо в папке src рядом с exe."""
+    names = ("jarvis.py", "jarvis_ai.py", "jarvis_settings.py")
+    out = [str(APP_DIR / n) for n in names if (APP_DIR / n).is_file()]
+    if not out:
+        out = [str(APP_DIR / "src" / n) for n in names if (APP_DIR / "src" / n).is_file()]
+    return out
+
+
 def ai_context() -> dict:
     launchers = [name for name, finder in (
         ("Genshin Impact", find_genshin), ("Minecraft", find_minecraft), ("Prism Launcher", find_prism),
         ("Discord", discord_command), ("Telegram", find_telegram)) if finder()]
     return {"mode": "игровой" if STATE.playing else "учебный", "steam_exe": find_steam(),
-            "launchers": launchers, "known_games": sorted(CFG["games"])}
+            "launchers": launchers, "known_games": sorted(CFG["games"]),
+            "folders": user_folders(),            # рабочий стол, загрузки, документы, фото…
+            "telegram": find_telegram(),          # путь к Telegram для отправки сообщений
+            "frozen": FROZEN,                     # собран в exe — правка кода требует пересборки
+            "self_files": _self_files(),          # нейросеть может редактировать сама себя (ai.self_edit)
+            "config_file": str(user_config_path())}
 
 
-ASSISTANT = jarvis_ai.Assistant(lambda: CFG["ai"], ai_context) if jarvis_ai else None
+def ai_file_written(path: str) -> None:
+    """Нейросеть записала файл — перечитать конфиг или напомнить о перезапуске."""
+    try:
+        p = Path(path)
+        if p.name == "config.json" and p.resolve() == user_config_path().resolve():
+            reload_config()
+            print("[ai] config.json перечитан")
+        elif p.suffix == ".py" and p.parent == APP_DIR:
+            notify(f"Я изменил свой код ({p.name}). Перезапусти Джарвиса, чтобы изменения вступили в силу.")
+    except Exception as e:  # noqa: BLE001
+        log_error("Правка файла нейросетью", e)
+
+
+# ----- действия нейросети: свои игры, сайты, команды, напоминания -------------
+
+def act_add_game(a) -> str:
+    phrase = _norm(str(a.get("phrase") or "").strip())
+    appid = int(a.get("appid") or 0)
+    if not phrase or appid <= 0:
+        raise ValueError("Нужны phrase (фраза) и appid (число из Steam).")
+    games = dict(CFG["games"])
+    games[phrase] = appid
+    save_user_config({"games": games})
+    return f"Добавил игру «{phrase}» (appid {appid}). Теперь запускается фразой: «запусти {phrase}»."
+
+
+def act_add_site(a) -> str:
+    phrase = _norm(str(a.get("phrase") or "").strip())
+    url = str(a.get("url") or "").strip()
+    if not phrase or not url:
+        raise ValueError("Нужны phrase и url.")
+    if not re.match(r"^[a-z][a-z0-9+.-]*://", url, re.I):
+        url = "https://" + url
+    sites = dict(CFG["sites"])
+    sites[phrase] = url
+    save_user_config({"sites": sites})
+    return f"Добавил сайт «{phrase}» ({url}). Открывается фразой: «открой {phrase}»."
+
+
+def act_add_command(a) -> str:
+    phrase = _norm(str(a.get("phrase") or "").strip())
+    target = str(a.get("target") or "").strip()
+    if not phrase or not target:
+        raise ValueError("Нужны phrase и target.")
+    cmds = [c for c in CFG["commands"] if c["phrase"] != phrase] + [{"phrase": phrase, "target": target}]
+    save_user_config({"commands": cmds})
+    return f"Добавил команду «{phrase}» → {target}. Скажи «{phrase}»."
+
+
+def act_add_reminder(a) -> str:
+    text = str(a.get("text") or "").strip()
+    at = str(a.get("at") or "").strip()
+    daily = str(a.get("repeat") or "").lower() in ("daily", "ежедневно", "каждый день") or bool(a.get("daily"))
+    if not text or not at:
+        raise ValueError("Нужны text и at.")
+    if daily and re.fullmatch(r"\d{1,2}:\d{2}", at):
+        at = f"{int(at.split(':')[0]):02d}:{at.split(':')[1]}"
+        reminder_add(text, at, True)
+        return f"Напомню каждый день в {at}: {text}."
+    dt = datetime.fromisoformat(at.replace(" ", "T"))  # «2026-10-07 20:00» или с Т
+    reminder_add(text, dt.strftime("%Y-%m-%d %H:%M"), False)
+    return f"Напоминание поставлено: «{text}» — {dt:%d.%m.%Y в %H:%M}."
+
+
+def act_list_reminders(a) -> str:
+    return reminders_text() or "Напоминаний нет."
+
+def act_delete_reminders(a) -> str:
+    reminders_save([])
+    return "Удалил все напоминания."
+
+
+def _schema(name: str, desc: str, props: dict, required: list) -> dict:
+    return {"type": "function", "function": {"name": name, "description": desc,
+                                             "parameters": {"type": "object", "properties": props,
+                                                            "required": required}}}
+
+
+AI_ACTION_TOOLS = [
+    (_schema("add_game", "Добавить игру в свои команды Джарвиса: голосовая фраза -> appid Steam",
+             {"phrase": {"type": "string", "description": "Как назвать игру голосом, например «вуконг»"},
+              "appid": {"type": "integer", "description": "appid из Steam"}},
+             ["phrase", "appid"]), act_add_game),
+    (_schema("add_site", "Добавить сайт в список «открой …»",
+             {"phrase": {"type": "string", "description": "Фраза, например «почта»"},
+              "url": {"type": "string", "description": "Адрес сайта"}},
+             ["phrase", "url"]), act_add_site),
+    (_schema("add_command", "Добавить свою команду: голосовая фраза -> программа, папка или ссылка",
+             {"phrase": {"type": "string", "description": "Фраза"},
+              "target": {"type": "string", "description": "notepad.exe, путь или https://…"}},
+             ["phrase", "target"]), act_add_command),
+    (_schema("add_reminder", "Поставить напоминание: сработает голосом в указанное время",
+             {"text": {"type": "string", "description": "О чём напомнить"},
+              "at": {"type": "string", "description": "«ГГГГ-ММ-ДД ЧЧ:ММ» (разовое) или «ЧЧ:ММ» (ежедневное)"},
+              "repeat": {"type": "string", "enum": ["once", "daily"],
+                         "description": "once — один раз, daily — каждый день"}},
+             ["text", "at"]), act_add_reminder),
+    (_schema("list_reminders", "Показать все напоминания", {}, []), act_list_reminders),
+    (_schema("delete_reminders", "Удалить все напоминания", {}, []), act_delete_reminders),
+]
+
+
+ASSISTANT = (jarvis_ai.Assistant(lambda: CFG["ai"], ai_context, on_write=ai_file_written,
+                                 actions=AI_ACTION_TOOLS) if jarvis_ai else None)
 
 
 def ai_ready() -> bool:
@@ -1204,11 +1789,15 @@ def ask_ai(question: str) -> None:
         try:
             if notifier:
                 notifier.show("Думаю…", True, 1500)
-            notify(ASSISTANT.ask(question))  # ответ уходит и во всплывашку, и в голос
+            answer = ASSISTANT.ask(question)  # ответ уходит и во всплывашку, и в голос
+            history_add("нейросеть", question, answer, ASSISTANT.last_tools)
+            notify(answer)
         except jarvis_ai.AIError as e:
+            history_add("нейросеть", question, f"ошибка: {e}")
             notify(str(e), ok=False)
         except Exception as e:
             log_error("Нейросеть", e)
+            history_add("нейросеть", question, "ошибка: нейросеть недоступна")
             notify("Нейросеть сейчас недоступна.", ok=False)
         finally:
             ASSISTANT.lock.release()
@@ -1337,16 +1926,29 @@ CLOSE = lambda t: has(t, "закр")
 # Третье поле — «только в игровом режиме».
 COMMANDS = [
     Cmd(lambda t: is_word(t, "выход", "выйти"), cmd_exit, False),
-    Cmd(lambda t: is_word(t, "отмена", "отмени", "отменить"), cmd_cancel_shutdown, False),
+    Cmd(lambda t: is_word(t, "отмена", "отмени", "отменить") and not has(t, "напоминани"),
+        cmd_cancel_shutdown, False),
     Cmd(lambda t: has(t, "настройк"), cmd_settings, False),
     # раньше своих команд: «загугли кс2» должно искать, а не запускать игру
     Cmd(lambda t: bool(SEARCH_RE.search(t)) and not TRACK_RE.search(t), cmd_search, False),
     Cmd(lambda t: _custom_match(t) is not None, cmd_custom, False),  # свои команды — раньше встроенных
     Cmd(lambda t: has(t, "выключ") and is_pc(t), cmd_shutdown, True),
     Cmd(lambda t: has(t, "перезагруз") and is_pc(t), cmd_restart, True),
+    Cmd(lambda t: has(t, "заметк", "запис") and has(t, "откр", "покаж", "показ", "прочита",
+                                                      "прочит", "посмотр", "читай", "очист",
+                                                      "удали", "удалит", "сотр", "стереть",
+                                                      "стер", "сброс", "удалить"),
+        cmd_notes, False),
     Cmd(lambda t: has(t, "запиш", "заметк"), cmd_note, False),
+    Cmd(lambda t: parse_create(t) is not None, cmd_create, False),  # «создай файл …», «создай папку …»
+    # «открой файл / папку / документ» — не сайт, а файл; раньше игр, «учеб» и «открой-сайт»
+    Cmd(wants_open_item, cmd_open, False),
     Cmd(is_help, cmd_help, False),
+    Cmd(lambda t: has(t, "истори"), cmd_history, False),  # история запросов / очисти историю
+    Cmd(lambda t: has(t, "напоминани"), cmd_reminders, False),  # покажи/удали напоминания
+    Cmd(lambda t: has(t, "напомни"), cmd_remind, False),        # напомни мне …
     Cmd(lambda t: is_word(t, "голос"), cmd_voice, False),
+    Cmd(lambda t: has(t, "забудь", "забыть") or has(t, "новый разговор"), cmd_forget, False),
     Cmd(lambda t: bool(TRACK_RE.search(t)), cmd_track, False),  # раньше «музык» и «песн»
     Cmd(lambda t: has(t, "музык") and CLOSE(t), lambda t: close_music_windows(), False),
     Cmd(lambda t: has(t, "музык"), lambda t: open_music(), False),
@@ -1376,6 +1978,54 @@ COMMANDS = [
 ]
 
 
+# Одиночные команды (состояние, выход, питание): в цепочках не участвуют —
+# «выключи пк и открой стим» выполнит только выключение, остальное проигнорирует.
+_SINGLE_RUNS = (cmd_exit, cmd_cancel_shutdown, cmd_shutdown, cmd_restart, cmd_voice, cmd_forget)
+
+
+def _chain_run(parts: list, addressed: bool) -> bool:
+    """Выполнить части фразы как цепочку команд по очереди («открой стим и заметки»).
+    Часть без глагола наследует его у предыдущей («заметки» -> «открой заметки»).
+    Возвращает True, только если ВСЕ части нашли свою команду, — иначе вызывающий
+    откатывается на обычную логику для целой фразы."""
+    matched = []
+    verb = ""
+    for part in parts:
+        cmd, trial = None, part
+        if verb:
+            # «заметки» после «открой стим» — это «открой заметки», а не «запиши»:
+            # пробуем с глаголом СНАЧАЛА, иначе голое слово совпадёт не с той командой
+            trial = f"{verb} {part}"
+            cmd = next((c for c in COMMANDS if c.match(trial)), None)
+        if cmd is None:
+            trial = part
+            cmd = next((c for c in COMMANDS if c.match(part)), None)
+        if cmd is None and ai_ready():
+            q = ai_question(part)
+            if q and jarvis_ai.is_question(q) and not is_help(q):
+                matched.append((None, q))  # вопрос нейросети — тоже часть цепочки
+                continue
+        if cmd is None:
+            return False
+        if cmd.run in _SINGLE_RUNS:  # выход/сон/голос/забывание — только отдельно, не в цепочке
+            return False
+        matched.append((cmd, trial))
+        verb = trial.split(" ", 1)[0]
+    P = CFG["phrases"]
+    for cmd, trial in matched:
+        if cmd is None:
+            ask_ai(trial)
+            continue
+        if cmd.play_only and not STATE.playing:
+            notify(f"Сейчас учебный режим. Скажи «{P['play_mode']}».", ok=False)
+            continue
+        cmd.run(trial)
+        # самим командам журналировать себя важнее (в них уже есть свой ответ)
+        if addressed and cmd.run not in (cmd_history, cmd_remind, cmd_reminders):
+            history_add("команда", trial, "выполнена")
+    return True
+
+
 def process(text: str) -> None:
     P = CFG["phrases"]
     if not STATE.listening:
@@ -1390,8 +2040,14 @@ def process(text: str) -> None:
             return
         text = text.replace(wake["word"], "", 1).strip()
 
-    # Обращение к Джарвису: слово-активатор уже проверено выше, иначе ищем имя в фразе
-    addressed = bool(wake["enabled"]) or any(n in text for n in CFG["ai"]["names"])
+    # Обращение к Джарвису: слово-активатор уже проверено выше, иначе ищем имя в фразе.
+    # Если Джарвис «держит внимание» (только что говорили) — имя можно не называть.
+    named = any(n in text for n in CFG["ai"]["names"])
+    attentive = time.time() < STATE.attention_until
+    addressed = bool(wake["enabled"]) or named or attentive
+    if addressed and ai_ready():
+        window = (CFG["ai"].get("chat") or {}).get("attention_sec", 25)
+        STATE.attention_until = time.time() + max(0.0, window)
     ask = ai_question(text) if addressed and ai_ready() else None
 
     if P["pause"] in text:
@@ -1407,6 +2063,14 @@ def process(text: str) -> None:
         notify("Включаю игровой режим.")
         return
 
+    # Несколько команд сразу: «открой стим и заметки», «запусти майнкрафт, потом музыку».
+    # Одиночные (пауза, режимы, сон/выход, голос, забывание) в цепочках не участвуют —
+    # их выполнение среди прочего было бы сюрпризом.
+    if not any(k in text for k in (P["pause"], P["study_mode"], P["play_mode"])):
+        parts = split_chain(text)
+        if len(parts) > 1 and _chain_run(parts, addressed):
+            return
+
     # вопрос («какая погода», «что поиграть») — сразу нейросети, а не по списку команд
     if ask and jarvis_ai.is_question(ask) and not is_help(ask):
         ask_ai(ask)
@@ -1418,6 +2082,9 @@ def process(text: str) -> None:
                 notify(f"Сейчас учебный режим. Скажи «{P['play_mode']}».", ok=False)
             else:
                 cmd.run(text)
+                # самим командам журналировать себя важнее (в них уже есть свой ответ)
+                if addressed and cmd.run not in (cmd_history, cmd_remind, cmd_reminders):
+                    history_add("команда", text, "выполнена")
             return
 
     if ask:  # обратились по имени, но это не команда — пусть ответит нейросеть
@@ -1545,9 +2212,12 @@ def ask_test(question: str) -> None:
         print("Модуль jarvis_ai не найден.")
         return
     try:
-        print(ASSISTANT.ask(_norm(question)))
+        answer = ASSISTANT.ask(_norm(question))
+        print(answer)
+        history_add("консоль", question, answer, ASSISTANT.last_tools)
     except jarvis_ai.AIError as e:
         print(f"[!!] {e}")
+        history_add("консоль", question, f"ошибка: {e}")
 
 
 def main() -> None:
@@ -1584,6 +2254,7 @@ def main() -> None:
     ready.wait(15)  # приветствие — после калибровки шума, чтобы голос не сбил порог
     if not STATE.stop.is_set():
         notify("Джарвис слушает вас, господин.")
+    threading.Thread(target=reminders_loop, daemon=True).start()  # напоминания: «напомни через …»
 
     try:
         main_loop()

@@ -38,6 +38,16 @@ if not exist "jarvis.ico" echo [Jarvis] jarvis.ico not found - building with the
 
 echo.
 echo [Jarvis] Done: dist\Jarvis.exe
+rem Sources next to the exe: Jarvis can edit his own code in dist\src (rebuild after changes).
+if not exist "dist\src" mkdir "dist\src"
+copy /y "jarvis.py" "dist\src\" >nul
+copy /y "jarvis_ai.py" "dist\src\" >nul
+copy /y "jarvis_settings.py" "dist\src\" >nul
+copy /y "requirements.txt" "dist\src\" >nul
+copy /y "build_exe.bat" "dist\src\" >nul
+copy /y "README.md" "dist\src\" >nul
+echo [Jarvis] Sources copied to dist\src - edit them, copy back to the project folder
+echo           and run build_exe.bat again to rebuild the exe.
 echo Put config.json next to it if you need one, then run it.
 goto :end
 

@@ -46,6 +46,9 @@ PHRASE_LABELS = [
     ("study_mode", "Учебный режим"),
     ("play_mode", "Игровой режим"),
 ]
+AI_STYLES = [("film", "Как в кино — учтивый, с характером"),
+             ("dry", "Сухо — только факты"),
+             ("brief", "Кратко — одно-два предложения")]
 
 # --- оформление -------------------------------------------------------------
 FONT = "Segoe UI"
@@ -604,14 +607,46 @@ class SettingsWindow:
         self.v_ai_names = _entry(card, ", ".join(a["names"]), width=300)
         self._field(card, 7, "Обращение к Джарвису", self.v_ai_names, "через запятую")
         self.v_ai_names.grid_configure(sticky="w")
+        self.v_ai_user = _entry(card, a.get("user_name", "сэр"), width=200)
+        self._field(card, 8, "Как обращаться к тебе", self.v_ai_user, "«сэр», «босс», по имени…")
+        self.v_ai_user.grid_configure(sticky="w")
+        self._ai_style_labels = {k: v for k, v in AI_STYLES}
+        self._ai_style_by_label = {v: k for k, v in AI_STYLES}
+        self.om_ai_style = ctk.CTkOptionMenu(
+            card, values=[v for _, v in AI_STYLES], width=300,
+            height=32, font=_font(), dropdown_font=_font(), fg_color=GHOST_H, button_color=ACCENT,
+            button_hover_color=ACCENT_H)
+        self.om_ai_style.set(self._ai_style_labels.get(a.get("style", "film"), AI_STYLES[0][1]))
+        self._field(card, 9, "Характер ответов", self.om_ai_style)
+        self.om_ai_style.grid_configure(sticky="w")
         self.sw_ai_pc = ctk.CTkSwitch(card, text="Рассказывать нейросети про мой ПК (железо, игры Steam)",
                                       font=_font(), progress_color=ACCENT)
-        self.sw_ai_pc.grid(row=8, column=0, columnspan=3, sticky="w", padx=16, pady=(8, 5))
+        self.sw_ai_pc.grid(row=10, column=0, columnspan=3, sticky="w", padx=16, pady=(8, 5))
         if a.get("pc_context", True):
             self.sw_ai_pc.select()
 
+        self.sw_ai_files = ctk.CTkSwitch(
+            card, text="Доступ к файлам ПК: чтение, создание и редактирование файлов и папок",
+            font=_font(), progress_color=ACCENT)
+        self.sw_ai_files.grid(row=11, column=0, columnspan=3, sticky="w", padx=16, pady=(8, 5))
+        if a.get("files", True):
+            self.sw_ai_files.select()
+
+        self.sw_ai_self = ctk.CTkSwitch(
+            card, text="Разрешить нейросети редактировать самого Джарвиса (его файлы и настройки)",
+            font=_font(), progress_color=ACCENT)
+        self.sw_ai_self.grid(row=12, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 5))
+        if a.get("self_edit", True):
+            self.sw_ai_self.select()
+
+        self.sw_hist = ctk.CTkSwitch(card, text="История запросов (файл history.jsonl, команда «история запросов»)",
+                                     font=_font(), progress_color=ACCENT)
+        self.sw_hist.grid(row=13, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 5))
+        if self.cfg.get("history", {}).get("enabled", True):
+            self.sw_hist.select()
+
         bar = ctk.CTkFrame(card, fg_color="transparent")
-        bar.grid(row=9, column=0, columnspan=3, sticky="ew", padx=16, pady=(8, 14))
+        bar.grid(row=14, column=0, columnspan=3, sticky="ew", padx=16, pady=(8, 14))
         self.btn_ai_test = _button(bar, "Проверить", self._ai_test, width=110)
         self.btn_ai_test.pack(side="left")
         self.lbl_ai_test = ctk.CTkLabel(bar, text="", font=_font(12), anchor="w", justify="left", wraplength=560)
@@ -625,6 +660,10 @@ class SettingsWindow:
                   "3. Скажи «Джарвис, какая сегодня погода?» — ответ придёт голосом и коротко.\n\n"
                   "Нейросеть отвечает только на фразы со словом из «Обращение к Джарвису», чтобы разговоры рядом "
                   "не тратили лимит. Команды вроде «открой ютуб» работают как раньше.\n\n"
+                  "Доступ к файлам: если включено, нейросеть читает, создаёт и меняет файлы на ПК (и сам "
+                  "Джарвис) через инструменты list_dir / read_file / write_file / edit_file. Системные папки "
+                  "Windows править нельзя, перед правкой создаётся копия .bak. Все запросы пишутся в "
+                  "историю (%USERPROFILE%\\.jarvis\\history.jsonl).\n\n"
                   "Приватность: вопросы и данные о ПК (если включено) уходят провайдеру. У бесплатного Gemini "
                   "вне ЕС запросы могут использоваться для обучения моделей. Ключ хранится в "
                   "%USERPROFILE%\\.jarvis\\config.json открытым текстом. Не выкладывай этот файл.")
@@ -655,7 +694,11 @@ class SettingsWindow:
             "base_url": "" if base == pre["base_url"] else base,
             "city": self.v_ai_city.get().strip() or "Днепр",
             "names": [n for n in (_norm(x) for x in self.v_ai_names.get().split(",")) if n] or ["джарвис"],
+            "user_name": self.v_ai_user.get().strip() or "сэр",
+            "style": self._ai_style_by_label.get(self.om_ai_style.get(), "film"),
             "pc_context": bool(self.sw_ai_pc.get()),
+            "files": bool(self.sw_ai_files.get()),
+            "self_edit": bool(self.sw_ai_self.get()),
         }
 
     def _ai_test(self) -> None:
@@ -781,7 +824,7 @@ class SettingsWindow:
             patch_ai = {"ai": self._ai_form()}
             if patch_ai["ai"]["enabled"] and not self.ai.resolve(patch_ai["ai"])[2]:
                 raise ValueError("Вставь API-ключ на вкладке «Нейросеть» или выключи нейросеть.")
-        return {
+        patch = {
             **patch_ai,
             "commands": [{"phrase": p, "target": t} for p, t in self.t_cmd.rows()],
             "games": {p: int(a) for p, a in self.t_games.rows()},
@@ -796,6 +839,11 @@ class SettingsWindow:
             "phrases": phrases,
             "paths": {k: v.get().strip() for k, v in self.v_paths.items() if v.get().strip()},
         }
+        sw_hist = getattr(self, "sw_hist", None)  # вкладка «Нейросеть» есть не всегда
+        if sw_hist is not None:
+            hist = self.cfg.get("history", {})
+            patch["history"] = {"enabled": bool(sw_hist.get()), "max": int(hist.get("max") or 300)}
+        return patch
 
     def save(self) -> None:
         try:
