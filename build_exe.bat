@@ -33,8 +33,10 @@ if not exist "jarvis.ico" echo [Jarvis] jarvis.ico not found - building with the
     --hidden-import pyaudiowpatch ^
     --hidden-import pyttsx3.drivers ^
     --hidden-import pyttsx3.drivers.sapi5 ^
+    --hidden-import piper ^
+    --hidden-import onnxruntime ^
     --hidden-import win32timezone ^
-    jarvis.py || goto :fail
+    jarvis.py jarvis_voice_piper.py jarvis_dictation.py || goto :fail
 
 echo.
 echo [Jarvis] Done: dist\Jarvis.exe

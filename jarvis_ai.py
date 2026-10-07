@@ -265,6 +265,12 @@ FILE_TOOLS = [
             "kind": {"type": "string", "enum": ["any", "dir", "file"], "description": "Что искать: папки, файлы или всё"}},
             "required": ["name"]}}},
     {"type": "function", "function": {
+        "name": "delete_path",
+        "description": "Удалить файл или папку (в корзину Windows, можно восстановить). Только по прямой просьбе «удали …»",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Путь к файлу или папке"}},
+            "required": ["path"]}}},
+    {"type": "function", "function": {
         "name": "read_history",
         "description": "Прочитать историю запросов к Джарвису (что пользователь просил раньше, ответы, напоминания)",
         "parameters": {"type": "object", "properties": {
@@ -477,16 +483,124 @@ def _open_path(path) -> str:
     return f"Открыл: {p}"
 
 
+# --- удаление в корзину ------------------------------------------------------
+
+def _delete_path(args: dict) -> str:
+    """Удаление в корзину Windows (можно восстановить). Ошибка — текстом."""
+    try:
+        target = _resolve(args.get("path"), must_exist=False)
+    except (ValueError, FileNotFoundError) as e:
+        return f"Ошибка: {e}"
+    if not target.exists():
+        # имя без пути («new file» вместо «new_file.txt»): ищем нечётко рядом
+        needle = re.sub(r"\.[a-z0-9]{1,5}$", "", str(args.get("path") or ""),
+                        flags=re.I).strip().lower().replace("ё", "е")
+        needle = re.sub(r"[_\-]+", " ", needle)
+        needle = re.sub(r"\s+", " ", needle).strip()
+        if needle:
+            roots = [Path.home() / "Desktop", Path.home() / "Documents",
+                     Path.home() / "Downloads", Path.home()]
+            try:
+                sys.path.insert(0, str(Path(__file__).resolve().parent))
+                import jarvis as _j
+                roots = [Path(p) for p in _j.user_folders().values()]
+            except Exception:
+                pass
+            for root in roots:
+                try:
+                    if not root.is_dir():
+                        continue
+                    for p in root.iterdir():
+                        n = re.sub(r"\.[a-z0-9]{1,5}$", "", p.name,
+                                   flags=re.I).lower().replace("ё", "е")
+                        n = re.sub(r"\s+", " ", re.sub(r"[_\-]+", " ", n)).strip()
+                        if needle == n or needle in n or n in needle:
+                            target = p
+                            break
+                    if target.exists():
+                        break
+                except OSError:
+                    continue
+    if not target.exists():
+        return f"Не найдено (нечего удалять): {target}"
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import jarvis as _j
+        ok, how = _j._trash_path(target)
+        return f"Удалено ({how}): {target}" if ok else f"Ошибка: {how}: {target}"
+    except OSError as e:
+        return f"Ошибка: {e}"
+
+
 # --- набор текста в активное окно -----------------------------------------------
 
 def _type_text(text: str) -> str:
     text = str(text or "")
     if not text:
         raise ValueError("Пустой текст.")
+    paste_delay, restore = 0.6, True
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import jarvis as _j
+        dc = (_j.CFG.get("dictation", {}) or {})
+        paste_delay = max(0.1, float(dc.get("paste_delay", 0.6)))
+        restore = bool(dc.get("restore_clipboard", True))
+    except Exception:
+        pass
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import jarvis_dictation as _d
+        cleaned = _d.cleanup(text) or text
+        _d._ensure_en_layout()  # иначе на RU-раскладке уйдёт Ctrl+М вместо Ctrl+V
+        time.sleep(0.15)
+        _d.type_into_active_window(cleaned, paste_delay=paste_delay,
+                                   restore_clipboard=restore)
+        return f"Напечатал в активном окне: {cleaned[:80]}"
+    except Exception:
+        pass
     _clip_set(text)
     time.sleep(0.4)
+    _ensure_en_layout_fallback()
     _pyautogui().hotkey("ctrl", "v")
     return f"Напечатал в активном окне: {text[:80]}"
+
+
+def _ensure_en_layout_fallback() -> None:
+    import ctypes
+    import time
+
+    user32 = ctypes.windll.user32
+    HKL_EN = 0x04090409
+    try:
+        user32.LoadKeyboardLayoutW("00000409", 1)
+    except Exception:
+        pass
+    try:
+        user32.ActivateKeyboardLayout(HKL_EN, 0)
+    except Exception:
+        pass
+    # Переключение через Alt+Shift, потом Win+Space (если клавиатурное исчисление не ушло)
+    for _ in range(2):
+        try:
+            user32.BlockInput(True)
+            user32.keybd_event(0x12, 0, 0, 0)  # Alt
+            user32.keybd_event(0x21, 0, 0, 0)  # Shift
+            user32.keybd_event(0x21, 0, ctypes.c_ulong(0x0001), 0)
+            user32.keybd_event(0x12, 0, ctypes.c_ulong(0x0002), 0)
+            user32.keybd_event(0x12, 0, 0, 0)
+            user32.BlockInput(False)
+            time.sleep(0.15)
+            user32.BlockInput(True)
+            user32.keybd_event(0x5B, 0, 0, 0)  # Win
+            user32.keybd_event(0x21, 0, 0, 0)  # Shift
+            user32.keybd_event(0x21, 0, ctypes.c_ulong(0x0001), 0)
+            user32.keybd_event(0x5B, 0, ctypes.c_ulong(0x0002), 0)
+            user32.keybd_event(0x5B, 0, 0, 0)
+            user32.BlockInput(False)
+            time.sleep(0.3)
+        except Exception:
+            break
+    time.sleep(0.1)
 
 
 # --- Steam -----------------------------------------------------------------
@@ -626,6 +740,9 @@ def _run_tool(name: str, args: dict, on_write, ctx=None) -> str:
 
     if name == "find_any":
         return _find_any(args.get("name"), str(args.get("kind") or "any"))
+
+    if name == "delete_path":
+        return _delete_path(args)
 
     if name == "read_history":
         try:
@@ -859,9 +976,11 @@ class Assistant:
                 "Файлы и папки (пути любые, все диски): list_dir — содержимое папки, read_file — прочитать, "
                 "find_files — файлы по маске в папке, find_any — найти файл или папку по названию по всему ПК "
                 "(«где файлы из колледжа»), open_path — открыть в Проводнике («открой папку с фотографиями»), "
-                "write_file — создать или перезаписать (append=true — дописать), edit_file — заменить фрагмент. "
+                "write_file — создать или перезаписать (append=true — дописать), edit_file — заменить фрагмент, "
+                "delete_path — удалить файл или папку в корзину (только по прямой просьбе «удали …»). "
                 "Если место для нового файла не названо — создавай на рабочем столе; папки создаются автоматически. "
-                "Перед правкой читай файл. Ничего не удаляй. В ответе не перечисляй длинные пути."
+                "Перед правкой читай файл. Удаляй только инструментом delete_path и только когда прямо просят. "
+                "В ответе не перечисляй длинные пути."
             )
             if ctx.get("folders"):
                 parts.append("Стандартные папки: " +
@@ -880,7 +999,8 @@ class Assistant:
                 "Пользователь сам говорит, о чём напомнить."
             )
             parts.append(
-                "Пользователь разрешил полный доступ: набирай текст (type_text — в активное окно), "
+                "Пользователь разрешил полный доступ: набирай текст (type_text — в активное окно, "
+                "речь автоматически чистится: опечатки и паразиты убираются, знаки препинания ставятся), "
                 "ищи, ставь и запускай игры Steam (steam_find, steam_install, steam_launch), "
                 "добавляй свои игры/сайты/команды (add_game, add_site, add_command) — после добавления скажи, "
                 "какой фразой это теперь можно запускать."

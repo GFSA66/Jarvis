@@ -499,12 +499,48 @@ class SettingsWindow:
             self.sw_voice.select()
         if self.say is not None:
             _button(card, "🔊  Проверить голос",
-                    lambda: self.say("Проверка голоса. Джарвис на связи."), width=150).grid(
+                    lambda: self.say("Проверка голоса. Джарвис на связи. Это живой нейроголос."), width=150).grid(
                 row=1, column=2, padx=(0, 16), pady=5)
+        # движок + живой голос Piper
+        voices = c.get("voice", {})
+        eng = (voices.get("engine") or "piper").lower()
+        cur_pv = (voices.get("piper_voice") or "dmitri").lower()
+        self.v_engine = ctk.CTkOptionMenu(card, values=["piper (живой)", "sapi (системный)"],
+                                          font=_font(), width=170)
+        self.v_engine.set("piper (живой)" if eng == "piper" else "sapi (системный)")
+        self._field(card, 2, "Движок голоса", self.v_engine, "piper — живой нейроголос офлайн")
+        self.v_engine.grid_configure(sticky="w")
+        self.v_piper = ctk.CTkOptionMenu(
+            card, values=["dmitri — мужской, живой", "ruslan — мужской, спокойный",
+                          "irina — женский", "denis — мужской"],
+            font=_font(), width=250)
+        labels = {"dmitri": "dmitri — мужской, живой", "ruslan": "ruslan — мужской, спокойный",
+                  "irina": "irina — женский", "denis": "denis — мужской"}
+        self.v_piper.set(labels.get(cur_pv, labels["dmitri"]))
+        self._field(card, 3, "Живой голос", self.v_piper, "первая реплика скачает ~63 МБ, дальше офлайн")
+        self.v_piper.grid_configure(sticky="w")
         self.v_delay = _entry(card, str(c["shutdown_delay_sec"]), width=80)
-        self._field(card, 2, "Задержка выключения / перезагрузки", self.v_delay, "секунд, от 0 до 600")
+        self._field(card, 4, "Задержка выключения / перезагрузки", self.v_delay, "секунд, от 0 до 600")
         self.v_delay.grid_configure(sticky="w")
-        ctk.CTkFrame(card, fg_color="transparent", height=10).grid(row=3, column=0)
+        ctk.CTkFrame(card, fg_color="transparent", height=10).grid(row=5, column=0)
+
+        # --- диктовка («надиктуй …» в активное окно)
+        card = self._card(sf, "Диктовка («надиктуй …»)", 1)
+        dc = c.get("dictation", {}) or {}
+        self.v_dict_delay = _entry(card, str(dc.get("delay_sec", 3)), width=80)
+        self._field(card, 1, "Пауза перед вставкой", self.v_dict_delay,
+                    "секунд на клик в нужное окно (0 — вставлять сразу)")
+        self.v_dict_delay.grid_configure(sticky="w")
+        self.v_dict_paste = _entry(card, str(dc.get("paste_delay", 0.6)), width=80)
+        self._field(card, 2, "Пауза перед Ctrl+V", self.v_dict_paste,
+                    "секунд; если вставляется часть текста — увеличь до 1–1.5")
+        self.v_dict_paste.grid_configure(sticky="w")
+        self.sw_dict_clip = ctk.CTkSwitch(card, text="Возвращать буфер обмена после вставки",
+                                          font=_font(), progress_color=ACCENT)
+        self.sw_dict_clip.grid(row=3, column=0, columnspan=3, sticky="w", padx=16, pady=5)
+        if dc.get("restore_clipboard", True):
+            self.sw_dict_clip.select()
+        ctk.CTkFrame(card, fg_color="transparent", height=10).grid(row=4, column=0)
 
         # --- слово-активатор
         card = self._card(sf, "Слово-активатор", 1)
@@ -830,7 +866,9 @@ class SettingsWindow:
             "games": {p: int(a) for p, a in self.t_games.rows()},
             "sites": {p: u for p, u in self.t_sites.rows()},
             "urls": {k: (v.get().strip() or None) for k, v in self.v_urls.items()},
-            "voice": {"enabled": bool(self.sw_voice.get())},
+            "voice": {"enabled": bool(self.sw_voice.get()),
+                      "engine": "piper" if self.v_engine.get().startswith("piper") else "sapi",
+                      "piper_voice": self.v_piper.get().split(" ")[0].lower() or "dmitri"},
             "shutdown_delay_sec": delay,
             "wake_word": {"enabled": bool(self.sw_wake.get()), "word": wake or "джарвис"},
             "chrome": {"main_profile": self.v_prof_main.get().strip() or "Default",

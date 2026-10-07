@@ -112,9 +112,12 @@ YT_MUSIC_WINDOW_TITLE = "YouTube Music"
 DEFAULT_CONFIG = {
     "language": "ru-RU",
     "wake_word": {"enabled": False, "word": "джарвис"},
-    "voice": {"enabled": True, "id": None, "rate": 175},
+    "voice": {"enabled": True, "engine": "piper", "piper_voice": "dmitri",
+              "id": None, "rate": 175},
+    "dictation": {"delay_sec": 3, "paste_delay": 0.6, "restore_clipboard": True},
     "shutdown_delay_sec": 15,
     "chrome": {"main_profile": "Default", "study_profile": None},
+    "autostart_exe": "",  # путь к собранному Jarvis.exe: если задан и существует — автозапуск ведёт на него
     "ytmusic": {"app_id": "cinhimbnkkaeohfgghhklpknlkffjgod", "press_space_on_track": True},
     "phrases": {
         "pause": "огуречный салат",
@@ -702,7 +705,59 @@ def make_sapi():
     return sp
 
 
+def _piper_rate_to_scale(wpm) -> float | None:
+    """Темп pyttsx3 (слов/мин) -> length_scale Piper (1.0 — норма).
+
+    Piper темп = длина фонем: больше значение — медленнее.
+    Возвращает None при обычном темпе (175), чтобы не трогать модель.
+    """
+    try:
+        wpm = int(wpm)
+    except (TypeError, ValueError):
+        return None
+    if wpm <= 0 or abs(wpm - 175) < 5:
+        return None
+    return max(0.5, min(2.0, round(175 / wpm, 2)))
+
+
+def _piper_available() -> bool:
+    try:
+        import piper  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _piper_say(text: str) -> None:
+    import jarvis_voice_piper as p
+
+    scale = _piper_rate_to_scale(CFG["voice"].get("rate", 175))
+    p.speak_piper(text, voice=CFG["voice"].get("piper_voice", "dmitri"),
+                  length_scale=scale)
+
+
+def _sapi_name():
+    try:
+        _sp, tokens = sapi_voices()
+    except Exception:
+        return None
+    tok = pick_sapi_voice(tokens)
+    if tok is not None:
+        return _token_info(tok)[0]
+    return None
+
+
 def current_voice_name():
+    engine = (CFG["voice"].get("engine") or "piper").lower()
+    if engine == "piper":
+        import jarvis_voice_piper as p
+
+        name = (CFG["voice"].get("piper_voice") or "dmitri").lower()
+        if not _piper_available():
+            return f"Piper «{name}» (нужен pip install piper-tts, пока SAPI)"
+        if p.is_downloaded(name):
+            return f"Piper «{name}» (живой нейроголос, офлайн)"
+        return f"Piper «{name}» (скачается ~63 МБ при первой реплике)"
     try:
         _sp, tokens = sapi_voices()
     except Exception:
@@ -717,8 +772,8 @@ class Speaker:
     """Очередь реплик + один воркер. busy выставляется сразу при постановке в очередь
     и снимается только когда очередь пуста — Джарвис не слышит сам себя.
 
-    Голос — Windows SAPI напрямую (pywin32). pyttsx3 после первой реплики в потоке
-    молчал: его runAndWait() работает один раз, поэтому он оставлен только запасным вариантом."""
+    Основной голос — Piper (живой нейроголос, офлайн).
+    Запасные: Windows SAPI напрямую (pywin32), затем pyttsx3."""
 
     def __init__(self):
         self.q: queue.Queue = queue.Queue()
@@ -730,6 +785,15 @@ class Speaker:
         if text:
             self.busy.set()
             self.q.put(text)
+
+    def _speak_sapi(self, text: str, sapi_state: list) -> None:
+        """Озвучка через SAPI. sapi_state=[sapi, sig] — кэш голоса между репликами."""
+        cur = (CFG["voice"]["id"], CFG["voice"]["rate"])
+        sapi, sig = sapi_state
+        if sapi is None or cur != sig:  # голос или скорость поменяли в настройках
+            sapi, sig = make_sapi(), cur
+            sapi_state[:] = [sapi, sig]
+        sapi.Speak(text, 0)  # 0 = дождаться конца фразы
 
     @staticmethod
     def _speak_pyttsx3(text: str) -> None:
@@ -750,18 +814,24 @@ class Speaker:
             pythoncom.CoInitialize()  # COM нужно инициализировать в том потоке, где говорим
         except Exception as e:
             log_error("COM", e)
-        sapi, sig, fails = None, None, 0
+        sapi_state: list = [None, None]
+        fails = 0
         while True:
             text = self.q.get()
             try:
-                cur = (CFG["voice"]["id"], CFG["voice"]["rate"])
-                if sapi is None or cur != sig:  # голос или скорость поменяли в настройках
-                    sapi, sig = make_sapi(), cur
-                sapi.Speak(text, 0)  # 0 = дождаться конца фразы
+                engine = (CFG["voice"].get("engine") or "piper").lower()
+                if engine == "piper" and _piper_available():
+                    try:
+                        _piper_say(text)
+                    except Exception as e:
+                        log_error("Озвучка (Piper)", e)
+                        self._speak_sapi(text, sapi_state)  # нет модели/интернета — SAPI
+                else:
+                    self._speak_sapi(text, sapi_state)
                 fails = 0
             except Exception as e:
                 log_error("Озвучка (SAPI)", e)
-                sapi = None
+                sapi_state[:] = [None, None]
                 fails += 1
                 try:
                     self._speak_pyttsx3(text)
@@ -1093,10 +1163,14 @@ CHAIN_SPLIT_RE = re.compile(r"\s*(?:,|\bи\b|\bа\s+также\b|\bпотом\b|
 
 def split_chain(text: str) -> list:
     """Фразу «открой стим и заметки» -> [«открой стим», «заметки»].
-    Пустые куски выбрасываем. Делим осторожно: «создай …» с « и » внутри не трогаем,
-    чтобы не развалить «создай папку моды и в ней файл список»."""
+    Пустые куски выбрасываем. Делим осторожно: «создай …» / «удали …» / «надиктуй …»
+    с « и » внутри не трогаем, чтобы не развалить «создай папку моды и в ней файл список»."""
     stripped = text.strip()
     if parse_create(stripped) is not None:
+        return [stripped]
+    if re.search(r"\b(?:удали|удалить|убери|сотри|стереть)\b", stripped):
+        return [stripped]
+    if re.search(r"\b(?:надиктуй|диктуй|диктовка|напечатай|набери|вставь)\b", stripped):
         return [stripped]
     parts = [p.strip(" ,.!?-—") for p in CHAIN_SPLIT_RE.split(stripped)]
     return [p for p in parts if p]
@@ -1132,6 +1206,10 @@ def commands_text() -> str:
 — открой <сайт> — сайт из списка: {", ".join(sorted(CFG["sites"]))}
 — запиши <текст> / заметка <текст> — сохранить заметку; открой заметки — показать; очисти заметки — удалить все ({NOTES_PATH})
 — создай файл <имя> / создай папку <имя> / создай папку <имя> и в ней файл <имя> — по умолчанию на рабочем столе
+— удали файл <имя> / удали папку <имя> — удаление (в корзину, можно восстановить)
+— удали команду <фраза> / удали игру <фраза> / удали сайт <фраза> — убрать свою команду
+— надиктуй <текст точка запятая вопрос> — умная диктовка: чистит речь, ставит знаки,
+  вставляет в активное окно (скажи «точка», «запятая», «новая строка» голосом)
 — напомни <что> через 10 минут / в 20:00 / каждый день в 9:00 — голосовое напоминание;
   напоминания — показать список, очисти напоминания — удалить все
 — «Джарвис, какая температура процессора?» — датчики ПК; «это норма?» — оценка по предыдущему ответу
@@ -1323,6 +1401,238 @@ def cmd_open(t):
     else:
         notify("Не понял, какой файл открыть. Назови точный путь либо включи нейросеть в настройках, "
                "вкладка «Нейросеть» — она найдёт файл сама.", ok=False)
+
+
+def _resolve_delete_target(t: str):
+    """Имя файла/папки из фразы удаления -> (имя, папка-поиска)."""
+    m = re.search(r"\b(?:файл\w*|папк\w*|документ\w*|директори\w*|каталог\w*)\s+"
+                  r"(?:с\s+именем\s+|под\s+названием\s+)?(.+?)(?=$|[.,!?])", t)
+    name = (m.group(1) if m else "").strip().strip("\"'«»")
+    name = re.sub(r"\b(пожалуйста|навсегда|окончательно)\b", "", name).strip()
+    if not name:
+        return None, None
+    return name, _create_dest(t)
+
+
+def _norm_name(s: str) -> str:
+    """Имя для нечёткого сравнения: нижний регистр, без расширения, ё->е, _ и - -> пробел."""
+    s = (s or "").strip().lower().replace("ё", "е")
+    s = re.sub(r"\.[a-z0-9]{1,5}$", "", s)  # расширение
+    s = re.sub(r"[_\-]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _find_delete_candidates(name: str, dest: Path, want_dir: bool) -> list:
+    """Кандидаты на удаление: точное имя, затем нечёткий поиск рядом.
+
+    Понимает «new file» -> «new_file.txt», игнорирует расширение.
+    Ищем только в папке-поиска и в стандартных папках (рабочий стол, документы,
+    загрузки) — полный обход всего ПК тут не нужен и может висеть минутами.
+    """
+    want = _norm_name(name)
+    exact = dest / name
+    if exact.exists():
+        if want_dir and not exact.is_dir():
+            pass  # просили папку, а нашёлся файл — ищем дальше
+        else:
+            return [exact]
+    cands = []
+    roots = [dest, *(Path(p) for p in user_folders().values())]
+    seen = set()
+    for root in roots:
+        try:
+            root = Path(root)
+            if not root.is_dir():
+                continue
+            for p in root.iterdir():
+                if str(p) in seen:
+                    continue
+                if want_dir and not p.is_dir():
+                    continue
+                norm = _norm_name(p.name)
+                if want == norm or want in norm or norm in want:
+                    seen.add(str(p))
+                    cands.append(p)
+                    if len(cands) >= 5:
+                        return cands
+            # точное совпадение с точками/подчёркиваниями: new file -> new_file*
+            for p in root.glob(f"*{name}*"):
+                if str(p) in seen:
+                    continue
+                seen.add(str(p))
+                if want_dir and not p.is_dir():
+                    continue
+                cands.append(p)
+                if len(cands) >= 5:
+                    return cands
+        except OSError:
+            continue
+    return cands
+
+
+def _trash_path(p: Path) -> tuple[bool, str]:
+    """Удалить файл/папку в корзину Windows. Возвращает (получилось, пояснение).
+
+    Основной путь — COM Shell.Application (именно он кладёт в корзину).
+    Путь упаковываем в base64, чтобы любые символы в имени/директории (вкл. кириллицу,
+    амперсанд, скобки, доллар и пр.) точно дойшли до PowerShell без искажений.
+    Запасной путь — прямое удаление (мимо корзины, но надёжно).
+    """
+    import base64
+    ps = (
+        "$s=New-Object -ComObject Shell.Application;"
+        "$f=$s.NameSpace('" + str(p.parent) + "');"
+        "$i=$f.ParseName('" + p.name + "');"
+        "if ($i) { $i.InvokeVerb('delete') } else { exit 2 }"
+    )
+    # UTF-16LE -> base64: не зависит от экранирования в -Command
+    ps_b64 = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+    proc = None
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", ps_b64],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=20,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        r = proc.returncode
+    except (OSError, subprocess.SubprocessError):
+        r = -1
+    # Дебаг-лог в консоль (не всплывает для пользователя)
+    try:
+        if proc is not None and proc.stderr:
+            _log = proc.stderr.decode("utf-8", "replace").strip()
+            if _log:
+                log_error("Удаление (COM stderr)", _log)
+    except Exception:
+        pass
+    time.sleep(0.8)
+    if not p.exists():
+        return True, "в корзину"
+    if r != 0:
+        # COM не сработал (OneDrive/нет Проводника/путь не в namespace) — удаляем напрямую
+        try:
+            if p.is_dir():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
+        except OSError as e:
+            return False, str(e)
+        return (not p.exists(), "напрямую (мимо корзины)" if not p.exists() else "сбой в системе")
+    return False, "сбой в системе (файл на месте)"
+
+
+def cmd_delete(t):
+    """«удали файл отчёт» / «удали папку моды» — в корзину (через PowerShell, можно восстановить)."""
+    name, dest = _resolve_delete_target(t)
+    if not name:
+        notify("Что удалить? Скажи: «удали файл …» или «удали папку …».", ok=False)
+        return
+    is_dir_word = bool(re.search(r"\b(?:папк\w*|директори\w*|каталог\w*)\b", t))
+    cands = _find_delete_candidates(name, dest, is_dir_word)
+    if not cands:
+        # точный путь из фразы («удали файл c:\…\отчёт.txt»)?
+        m = _OPEN_PATH.search(t)
+        if m:
+            p = Path(os.path.expandvars(os.path.expanduser(m.group(0).strip().strip("\"'"))))
+            if p.exists():
+                cands = [p]
+    if not cands:
+        notify(f"Не нашёл «{name}» — нечего удалять.", ok=False)
+        return
+    if len(cands) > 1:
+        notify(f"Нашёл несколько «{name}» — уточни место, например «в загрузках». "
+               f"Первый вариант: {cands[0]}", ok=False)
+        return
+    p = cands[0]
+    try:
+        ok, how = _trash_path(p)
+    except OSError as e:
+        log_error("Удаление файла", e)
+        notify(f"Не удалось удалить «{name}».", ok=False)
+        return
+    if ok:
+        notify(f"Удалил ({how}): {p.name} ({p.parent}).")
+    else:
+        log_error("Удаление файла", RuntimeError(f"{p}: {how}"))
+        notify(f"Удалить файл не получилось: {how}.", ok=False)
+
+
+def cmd_delete_command(t):
+    """«удали команду блокнот» / «забудь команду …» — убрать свою команду из настроек."""
+    rest = re.sub(r"\b(?:удали|удалить|убери|забудь|сотри|стереть)\b", "", t)
+    rest = re.sub(r"\b(?:команду|команда|команды|фразу|приложение|игру|сайт)\b", "", rest)
+    rest = re.sub(r"\b(?:пожалуйста|навсегда)\b", "", rest).strip(" ,.!?-—")
+    if not rest:
+        notify("Какую команду удалить? Скажи: «удали команду …».", ok=False)
+        return
+    key = _norm(rest)
+    cmds = list(CFG["commands"])
+    hit = next((c for c in cmds if c["phrase"] == key or key in c["phrase"]
+                or c["phrase"] in key), None)
+    if hit:
+        cmds = [c for c in cmds if c["phrase"] != hit["phrase"]]
+        save_user_config({"commands": cmds})
+        notify(f"Удалил команду «{hit['phrase']}».")
+        return
+    games = dict(CFG["games"])
+    ghit = next((k for k in games if k == key or key in k or k in key), None)
+    if ghit:
+        del games[ghit]
+        save_user_config({"games": games})
+        notify(f"Удалил игру «{ghit}».")
+        return
+    sites = dict(CFG["sites"])
+    shit = next((k for k in sites if k == key or key in k or k in key), None)
+    if shit:
+        del sites[shit]
+        save_user_config({"sites": sites})
+        notify(f"Удалил сайт «{shit}».")
+        return
+    notify(f"Не нашёл команду «{rest}». Свои команды: "
+           + (", ".join(c["phrase"] for c in cmds) or "пока нет"), ok=False)
+
+
+def cmd_dictate(t):
+    """«надиктуй …» / «напечатай …» — почистить речь и вставить в активное окно.
+
+    Задержки из config.json -> dictation: delay_sec (дать кликнуть в окно),
+    paste_delay (пауза перед Ctrl+V — медленным окнам нужно больше),
+    restore_clipboard (вернуть старый буфер после вставки).
+    """
+    m = re.search(r"\b(?:надиктуй|диктуй|диктовка|напечатай|набери|вставь)\b\s*(.*)", t)
+    raw = (m.group(1) if m else "").strip()
+    if not raw:
+        notify("Что напечатать? Скажи: «надиктуй привет точка как дела вопрос».", ok=False)
+        return
+    try:
+        import jarvis_dictation as d
+    except ImportError as e:
+        notify(f"Модуль диктовки не найден: {e}", ok=False)
+        return
+    text = d.cleanup(raw)
+    if not text:
+        notify("Не расслышал текст для диктовки.", ok=False)
+        return
+    dc = CFG.get("dictation", {}) or {}
+    try:
+        delay = max(0.0, float(dc.get("delay_sec", 3)))
+    except (TypeError, ValueError):
+        delay = 3.0
+    try:
+        paste_delay = max(0.1, float(dc.get("paste_delay", 0.6)))
+    except (TypeError, ValueError):
+        paste_delay = 0.6
+    restore = bool(dc.get("restore_clipboard", True))
+    if delay > 0:
+        notify(f"Вставляю «{text}» через {delay:g} с — кликни куда нужно…")
+        time.sleep(delay)
+    try:
+        d.type_into_active_window(text, paste_delay=paste_delay,
+                                  restore_clipboard=restore)
+        notify(f"Вставил: {text}")
+    except Exception as e:
+        log_error("Диктовка", e)
+        notify("Не удалось вставить текст.", ok=False)
 
 
 def cmd_create(t):
@@ -1599,7 +1909,14 @@ def cmd_remind(t):
 
 def show_text(name: str, text: str) -> None:
     """Печатает в консоль, а в exe без консоли — пишет файл и открывает его."""
-    print(text)
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        # консоль Windows в cp1251 не знает ✓/✗/«» — печатаем ASCII-вариант
+        safe = (text.replace("✓", "[+]").replace("✗", "[ ]").replace("«", '"').replace("»", '"')
+                .replace("—", "-").replace("…", "..."))
+        print(safe.encode(sys.stdout.encoding or "cp1251", "replace").decode(
+            sys.stdout.encoding or "cp1251"))
     if sys.stdout is None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         path = DATA_DIR / name
@@ -1941,6 +2258,18 @@ COMMANDS = [
         cmd_notes, False),
     Cmd(lambda t: has(t, "запиш", "заметк"), cmd_note, False),
     Cmd(lambda t: parse_create(t) is not None, cmd_create, False),  # «создай файл …», «создай папку …»
+    # удаление — раньше своих команд: «удали команду блокнот» не должно запускать блокнот
+    Cmd(lambda t: has(t, "удали", "удалить", "убери", "сотри", "стереть") and has(t, "команду", "команда",
+                                                                                 "фразу", "игру", "сайт"),
+        cmd_delete_command, False),
+    Cmd(lambda t: (has(t, "удали", "удалить", "убери", "сотри", "стереть", "удалю", "удалён")
+                   and has(t, "файл", "папк", "документ", "директори", "каталог"))
+        or has(t, "удали файл", "удали папку", "удалить файл", "удалить папку"),
+        cmd_delete, False),
+    # диктовка — раньше «найди» и раньше нейронки: «напечатай …» вставляет, а не гуглит/спрашивает
+    Cmd(lambda t: bool(re.search(r"\b(?:надиктуй|диктуй|диктовка|напечатай|напечать|"
+                                 r"набери|набрать|вставь|вставить|продиктуй)\b", t)),
+        cmd_dictate, False),
     # «открой файл / папку / документ» — не сайт, а файл; раньше игр, «учеб» и «открой-сайт»
     Cmd(wants_open_item, cmd_open, False),
     Cmd(is_help, cmd_help, False),
@@ -2071,8 +2400,19 @@ def process(text: str) -> None:
         if len(parts) > 1 and _chain_run(parts, addressed):
             return
 
-    # вопрос («какая погода», «что поиграть») — сразу нейросети, а не по списку команд
-    if ask and jarvis_ai.is_question(ask) and not is_help(ask):
+    # вопрос («какая погода», «что поиграть») — сразу нейросети, а не по списку команд.
+    # НО: диктовка («напечатай …») и удаление («удали файл …») — всегда локальные команды,
+    # даже если сказаны с обращением «Джарвис»: иначе «напечатай в телеграм» уходит нейронке.
+    _local_first = re.search(r"\b(?:надиктуй|диктуй|диктовка|напечатай|напечать|"
+                             r"набери|набрать|вставь|вставить|продиктуй)\b", text)
+    if _local_first:
+        for cmd in COMMANDS:
+            if cmd.run is cmd_dictate and cmd.match(text):
+                cmd.run(text)
+                if addressed:
+                    history_add("команда", text, "выполнена")
+                return
+    if ask and jarvis_ai.is_question(ask) and not is_help(ask) and not _local_first:
         ask_ai(ask)
         return
 
@@ -2169,7 +2509,8 @@ def print_check() -> None:
         ("Genshin Impact", f"задача {CFG['genshin_task']}" if CFG["genshin_task"] else find_genshin()),
         ("Minecraft Launcher", find_minecraft()),
         ("Prism Launcher", find_prism()),
-        ("Голос (SAPI)", current_voice_name()),
+        ("Голос", current_voice_name()),
+        ("Голос (запасной SAPI)", _sapi_name() or None),
         ("Голос (запасной pyttsx3)", "установлен" if pyttsx3 else None),
         ("Нейросеть", (f"{CFG['ai']['provider']}, ключ {'задан' if jarvis_ai and jarvis_ai.resolve(CFG['ai'])[2] else 'НЕ задан'}"
                        if CFG["ai"]["enabled"] else "выключена (настройки → Нейросеть)") if jarvis_ai else None),
@@ -2184,6 +2525,20 @@ def print_check() -> None:
 
 
 def list_voices() -> None:
+    print("Живые нейроголоса Piper (офлайн, auto-скачивание ~63 МБ):")
+    try:
+        import jarvis_voice_piper as p
+
+        for name, ok, size in p.list_status():
+            mark = "скачан" if ok else "скачается при первом использовании"
+            extra = f" ({size} МБ)" if ok else ""
+            cur = "  <-- текущий" if name == (CFG["voice"].get("piper_voice") or "dmitri") else ""
+            print(f"  {name}{extra}: {mark}{cur}")
+        print("Смена голоса: config.json -> voice.piper_voice "
+              "(dmitri | ruslan | irina | denis) или в окне настроек.")
+    except Exception as e:
+        print(f"Piper недоступен: {e} (pip install piper-tts)")
+    print("\nГолоса Windows SAPI (запасные):")
     try:
         _sp, tokens = sapi_voices()
     except Exception as e:
