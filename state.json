@@ -1,0 +1,20 @@
+{
+ "status": {
+  "route": "dverified",
+  "delete": "fixed",
+  "dictation": "в процессе ручной проверки; deletion=проверено",
+  "docs": "updated"
+ },
+ "verified": [
+  "py_compile jarvis.py jarvis_ai.py jarvis_dictation.py jarvis_settings.py -> COMPILE_ALL_OK",
+  "jarvis.py --check -> all checks pass (Chrome, Telegram, Piper, Gemini)",
+  "cleanup('надиктуй привет точка как дела вопрос') -> 'Надиктуй привет. Как дела?'; paste_delay/en-layout in _type_text",
+  "DELETE: тесты удаления через _trash_path — 4 файла (test_trash.txt, test_trash.bin, тест_del.txt, тест_del.bin) удалены в корзину, COM Base64-путь работает",
+  "DICTATION: _ensure_en_layout + 3x Ctrl+V retry + лог — вставка через буфер обмена; ручная проверка GUI в процессе"
+ ],
+ "unknowns": [],
+ "lessons": [
+  "PowerShell: no && || ; use python -c for verification",
+  "COM Shell крашится в неинтерактивной среде, но в GUI удаляет всё корректно; base64-экранирование убрало проблемы с кириллицей в путях"
+ ]
+}
