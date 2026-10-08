@@ -366,6 +366,19 @@ def media_key(key: str) -> None:
     _press_key(vk)
 
 
+def gamebar_record_last() -> None:
+    """Win+Alt+G — «Записать последние» в Xbox Game Bar.
+
+    Windows должна разрешать фоновую запись; иначе сама Game Bar покажет причину.
+    """
+    user32 = ctypes.windll.user32
+    VK_LWIN, VK_MENU, VK_G = 0x5B, 0x12, 0x47
+    for vk in (VK_LWIN, VK_MENU, VK_G):
+        user32.keybd_event(vk, 0, 0, 0)
+    for vk in (VK_G, VK_MENU, VK_LWIN):
+        user32.keybd_event(vk, 0, 2, 0)
+
+
 # Заголовки окон известных плееров: подстрока -> подпись
 PLAYER_TITLES = (
     ("youtube music", "YouTube Music"),
@@ -673,6 +686,21 @@ def clipboard_set_text(text: str) -> bool:
         user32.CloseClipboard()
 
 
+def clipboard_selected_text() -> str | None:
+    """Скопировать выделение Ctrl+C и вернуть прежнее текстовое содержимое буфера."""
+    old = clipboard_get_text()
+    user32 = ctypes.windll.user32
+    _send_vk(user32, VK_CONTROL)
+    _send_vk(user32, ord("C"))
+    _send_vk(user32, ord("C"), 2)
+    _send_vk(user32, VK_CONTROL, 2)
+    time.sleep(0.15)
+    selected = clipboard_get_text()
+    if old is not None:
+        clipboard_set_text(old)
+    return selected
+
+
 def paste_via_clipboard(text: str, restore: bool = True,
                         paste_delay: float = 0.3) -> None:
     """Сохранить буфер -> вставить текст Ctrl+V -> вернуть буфер."""
@@ -737,7 +765,9 @@ def window_is_elevated(hwnd: int) -> bool | None:
     TOKEN_QUERY = 0x0008
     try:
         kernel32, advapi32 = ctypes.windll.kernel32, ctypes.windll.advapi32
-        hproc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, hwnd)
+        pid = wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        hproc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
         if not hproc:
             return None
         try:

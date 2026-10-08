@@ -30,12 +30,29 @@ if not exist "jarvis.ico" echo [Jarvis] jarvis.ico not found - building with the
     --collect-all customtkinter ^
     --collect-all speech_recognition ^
     --collect-data ytmusicapi ^
+    --collect-data jarvis_settings ^
+    --collect-data jarvis_utils ^
+    --collect-data jarvis_system ^
+    --collect-data jarvis_timers ^
+    --collect-data jarvis_integrations ^
     --hidden-import pyaudiowpatch ^
     --hidden-import pyttsx3.drivers ^
     --hidden-import pyttsx3.drivers.sapi5 ^
     --hidden-import piper ^
     --hidden-import onnxruntime ^
     --hidden-import win32timezone ^
+    --hidden-import pycaw ^
+    --hidden-import comtypes ^
+    --hidden-import comtypes.gen ^
+    --hidden-import psutil ^
+    --hidden-import screen_brightness_control ^
+    --hidden-import keyring ^
+    --hidden-import winsdk ^
+    --hidden-import requests ^
+    --hidden-import jarvis_utils ^
+    --hidden-import jarvis_system ^
+    --hidden-import jarvis_timers ^
+    --hidden-import jarvis_integrations ^
     jarvis.py jarvis_voice_piper.py jarvis_dictation.py || goto :fail
 
 echo.
@@ -45,6 +62,11 @@ if not exist "dist\src" mkdir "dist\src"
 copy /y "jarvis.py" "dist\src\" >nul
 copy /y "jarvis_ai.py" "dist\src\" >nul
 copy /y "jarvis_settings.py" "dist\src\" >nul
+copy /y "jarvis_utils.py" "dist\src\" >nul
+copy /y "jarvis_system.py" "dist\src\" >nul
+copy /y "jarvis_timers.py" "dist\src\" >nul
+copy /y "jarvis_integrations.py" "dist\src\" >nul
+copy /y "config.example.json" "dist\src\" >nul
 copy /y "requirements.txt" "dist\src\" >nul
 copy /y "build_exe.bat" "dist\src\" >nul
 copy /y "README.md" "dist\src\" >nul

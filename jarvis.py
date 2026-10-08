@@ -16,6 +16,7 @@ import copy
 import ctypes
 import difflib
 import glob
+import hashlib
 import json
 import os
 import queue
@@ -97,6 +98,26 @@ try:
 except ImportError:
     jarvis_ai = None
 
+try:
+    import jarvis_utils as ju
+except ImportError:
+    ju = None
+
+try:
+    import jarvis_system as js
+except ImportError:
+    js = None
+
+try:
+    import jarvis_timers as jt
+except ImportError:
+    jt = None
+
+try:
+    import jarvis_integrations as ji
+except ImportError:
+    ji = None
+
 pyautogui.FAILSAFE = False
 
 # ============================================================================
@@ -120,9 +141,25 @@ DEFAULT_CONFIG = {
     "wake_word": {"enabled": False, "word": "джарвис"},
     "voice": {"enabled": True, "engine": "piper", "piper_voice": "dmitri",
               "id": None, "rate": 175},
-    "dictation": {"delay_sec": 3, "paste_delay": 0.6, "restore_clipboard": True},
+    "dictation": {"delay_sec": 3, "paste_delay": 0.6, "restore_clipboard": True,
+                  "method": "auto", "char_delay_ms": 8, "autoformat": True,
+                  "idle_timeout_sec": 120, "blacklist": ["пароль", "password", " pin ",
+                  "1password", "bitwarden", "keepass"], "confirm_unknown": False,
+                  "indicator": True},
     "hud": {"theme": "jarvis_blue", "width": 360, "glow": True, "anim": True},
     "shutdown_delay_sec": 15,
+    "security": {"confirm_dangerous": True, "password_salt": "", "password_hash": ""},
+    "notifications": {"position": "bottom_right", "duration_ms": 5000,
+                      "font_size": 14, "theme": "dark"},
+    "system": {"app_aliases": {"хром": "chrome.exe", "браузер": "chrome.exe",
+               "блокнот": "notepad.exe", "телеграм": "telegram.exe", "дискорд": "discord.exe"},
+               "sound_devices": {}},
+    "integrations": {"weather_city": "", "latitude": "", "longitude": "",
+                     "translation_language": "английский", "telegram_token": "",
+                     "telegram_contacts": {}, "discord_webhooks": {}, "test_project": "",
+                     "test_command": "pytest", "test_timeout_sec": 300,
+                     "hotkey": "ctrl+alt+j", "daily_reminders": []},
+    "history": {"enabled": True, "max": 300, "max_bytes": 1048576},
     "chrome": {"main_profile": "Default", "study_profile": None},
     "autostart_exe": "",  # путь к собранному Jarvis.exe: если задан и существует — автозапуск ведёт на него
     "ytmusic": {"app_id": "cinhimbnkkaeohfgghhklpknlkffjgod", "press_space_on_track": True},
@@ -196,7 +233,6 @@ DEFAULT_CONFIG = {
     },
     # История запросов к Джарвису: %USERPROFILE%\.jarvis\history.jsonl
     # (команды «история запросов» и «очисти историю»)
-    "history": {"enabled": True, "max": 300},
 }
 
 # Эти разделы при загрузке ЗАМЕНЯЮТСЯ целиком (а не дополняются значениями по умолчанию) —
@@ -300,6 +336,11 @@ def reload_config() -> None:
               find_genshin, find_minecraft, find_prism):
         f.cache_clear()
     STATE.voice_enabled = bool(CFG["voice"]["enabled"])
+    if HOTKEY and js:
+        try:
+            HOTKEY.start(CFG.get("integrations", {}).get("hotkey", "ctrl+alt+j"))
+        except Exception as e:  # noqa: BLE001
+            log_error("Горячая клавиша", e)
 
 
 _MERGE_KEYS = ("voice", "wake_word", "chrome", "ai", "hud")
@@ -308,6 +349,17 @@ _MERGE_KEYS = ("voice", "wake_word", "chrome", "ai", "hud")
 def save_user_config(patch: dict) -> None:
     """Записать изменения из окна настроек в ~/.jarvis/config.json и применить."""
     path = user_config_path()
+    if path.is_file():
+        try:
+            backups = DATA_DIR / "backups"
+            backups.mkdir(parents=True, exist_ok=True)
+            backup = backups / f"config-{datetime.now():%Y%m%d-%H%M%S}.json"
+            shutil.copy2(path, backup)
+            if ju:
+                for name in ju.backup_names_to_delete([p.name for p in backups.glob("config-*.json")], 20):
+                    (backups / name).unlink(missing_ok=True)
+        except Exception as e:
+            log_error("Резервная копия настроек", e)
     data: dict = {}
     if path.is_file():
         try:
@@ -316,7 +368,7 @@ def save_user_config(patch: dict) -> None:
             shutil.copy2(path, path.with_suffix(".json.bak"))  # битый файл не теряем
             data = {}
     for k, v in patch.items():
-        if k in _MERGE_KEYS and isinstance(data.get(k), dict):
+        if (k in _MERGE_KEYS or isinstance(v, dict)) and isinstance(data.get(k), dict) and isinstance(v, dict):
             data[k].update(v)
         else:
             data[k] = v
@@ -571,7 +623,9 @@ class Notifier:
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
-    def show(self, message: str, ok: bool = True, duration_ms: int = 2000) -> None:
+    def show(self, message: str, ok: bool = True, duration_ms: int | None = None) -> None:
+        if duration_ms is None:
+            duration_ms = int(CFG.get("notifications", {}).get("duration_ms", 5000))
         self.q.put(("popup", message, ok, duration_ms))
 
     def call(self, fn) -> None:
@@ -595,12 +649,16 @@ class Notifier:
 
         def layout():
             sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-            y = sh - int(60 * k)
-            for w in reversed(active):  # новейшее — снизу
+            pos = CFG.get("notifications", {}).get("position", "bottom_right")
+            top, left = pos.startswith("top"), pos.endswith("left")
+            y = int(60 * k) if top else sh - int(60 * k)
+            for w in (active if top else reversed(active)):
                 w.update_idletasks()
-                y -= w.winfo_reqheight()
-                w.geometry(f"+{sw - w.winfo_reqwidth() - int(20 * k)}+{y}")
-                y -= int(8 * k)
+                h = w.winfo_reqheight()
+                if not top: y -= h
+                x = int(20 * k) if left else sw - w.winfo_reqwidth() - int(20 * k)
+                w.geometry(f"+{x}+{y}")
+                y += (h + int(8 * k)) if top else -int(8 * k)
 
         def remove(w):
             if w in active:
@@ -630,12 +688,21 @@ class Notifier:
                             continue
                         except Exception as e:
                             log_error("HUD", e)
-                    bg = "#1f3d2b" if ok else "#3d1f1f"
+                    theme = CFG.get("notifications", {}).get("theme", "dark")
+                    palette = {"dark": ("#1f3d2b" if ok else "#3d1f1f", "#ffffff"),
+                               "light": ("#dff7e9" if ok else "#ffe5e5", "#18222d"),
+                               "minimal": ("#18222d", "#dce7ee")}
+                    bg, fg = palette.get(theme, palette["dark"])
                     w = tk.Toplevel(root)
                     w.overrideredirect(True)
                     w.attributes("-topmost", True)
+                    try:
+                        ex = ctypes.windll.user32.GetWindowLongW(w.winfo_id(), -20)
+                        ctypes.windll.user32.SetWindowLongW(w.winfo_id(), -20, ex | 0x08000000 | 0x00000080)
+                    except Exception:
+                        pass
                     w.configure(bg=bg)
-                    tk.Label(w, text=msg, bg=bg, fg="#ffffff", font=("Segoe UI", 11),
+                    tk.Label(w, text=msg, bg=bg, fg=fg, font=("Segoe UI", int(CFG.get("notifications", {}).get("font_size", 14))),
                              padx=int(16 * k), pady=int(10 * k), wraplength=int(320 * k), justify="left").pack()
                     active.append(w)
                     layout()
@@ -873,11 +940,88 @@ class State:
         self.voice_enabled = bool(CFG["voice"]["enabled"])
         self.stop = threading.Event()
         self.attention_until = 0.0  # до этого момента Джарвис «держит внимание» — имя можно не называть
+        self.dictation_mode = False
+        self.dictation_last_seen = 0.0
+        self.dictation_buffer = ""
+        self.dictation_last_chunk = ""
+        self.pending_confirm: dict | None = None
 
 
 STATE = State()
 notifier: Notifier | None = None
 speaker: Speaker | None = None
+HOTKEY = None
+JOURNAL_PATH = DATA_DIR / "journal.jsonl"
+TODO_PATH = DATA_DIR / "todo.json"
+TIMERS_PATH = DATA_DIR / "timers.json"
+LAST_TESTS_PATH = DATA_DIR / "last_tests.txt"
+TIMER_STORE = jt.TimerStore(TIMERS_PATH) if jt else None
+
+
+def _async(label: str, fn) -> None:
+    """Долгая операция вне потока распознавания с единым сообщением об ошибке."""
+    def work():
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            log_error(label, e)
+            notify(f"Не получилось: {e}", ok=False)
+    threading.Thread(target=work, daemon=True, name=f"jarvis-{label[:16]}").start()
+
+
+def journal_add(action: str, undo: dict | None = None, reversible: bool = False) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        row = {"time": f"{datetime.now():%Y-%m-%d %H:%M:%S}", "action": action,
+               "reversible": bool(reversible), "undo": undo or {}}
+        with JOURNAL_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as e:  # noqa: BLE001
+        log_error("Журнал действий", e)
+
+
+def _password_ok(text: str) -> bool:
+    sec = CFG.get("security", {})
+    digest, salt = sec.get("password_hash") or "", sec.get("password_salt") or ""
+    if not digest:
+        return True
+    candidate = hashlib.sha256((salt + (text or "").strip().lower()).encode("utf-8")).hexdigest()
+    return candidate == digest
+
+
+def confirm(action_name: str, prompt: str, on_yes, password_required: bool = False) -> None:
+    """Общее голосовое подтверждение, обрабатывается в начале process()."""
+    if not CFG.get("security", {}).get("confirm_dangerous", True):
+        on_yes()
+        return
+    STATE.pending_confirm = {"name": action_name, "on_yes": on_yes,
+                             "until": time.time() + 10.0, "password": password_required}
+    needs_phrase = password_required and bool(CFG.get("security", {}).get("password_hash"))
+    STATE.pending_confirm["password"] = needs_phrase
+    notify(prompt + (" Назови парольную фразу или скажи «нет»." if needs_phrase else " Скажи «да» или «нет»."), force_speak=True)
+
+
+def _process_confirmation(text: str) -> bool:
+    pending = STATE.pending_confirm
+    if not pending:
+        return False
+    if time.time() > pending["until"]:
+        STATE.pending_confirm = None
+        notify("Время подтверждения вышло.", ok=False)
+        return True
+    if is_word(text, "нет", "отмена", "отмени"):
+        STATE.pending_confirm = None
+        notify("Отменено.")
+        return True
+    if not pending["password"] and is_word(text, "да", "давай", "подтверждаю"):
+        STATE.pending_confirm = None
+        pending["on_yes"]()
+        return True
+    if pending["password"] and _password_ok(text):
+        STATE.pending_confirm = None
+        pending["on_yes"]()
+        return True
+    return True
 
 
 def speakable(message: str) -> str:
@@ -890,7 +1034,8 @@ def speakable(message: str) -> str:
 def notify(message: str, ok: bool = True, force_speak: bool = False) -> None:
     print((("[ok] " if ok else "[!!] ") + message))
     if notifier:
-        notifier.show(message, ok, max(2000, min(15000, 60 * len(message))))  # длинные ответы показываем дольше
+        base = int(CFG.get("notifications", {}).get("duration_ms", 5000))
+        notifier.show(message, ok, max(base, min(15000, 60 * len(message))))
     if speaker and (STATE.voice_enabled or force_speak):
         speaker.say(speakable(message))
 
@@ -1226,6 +1371,14 @@ def commands_text() -> str:
 — закрой браузер — закрыть все окна Chrome
 — открой <сайт> — сайт из списка: {", ".join(sorted(CFG["sites"]))}
 — запиши <текст> / заметка <текст> — сохранить заметку; открой заметки — показать; очисти заметки — удалить все ({NOTES_PATH})
+— громче / тише / громкость на 30; ярче / темнее / яркость 70; выключи или включи звук
+— заблокируй ПК; режим сна; гибернация; что запущено; что грузит процессор; сделай скриншот
+— пауза / играй; следующий или предыдущий трек; что сейчас играет; переключи звук на наушники / колонки
+— <приложение> тише / громче / громкость на 30; закрой <приложение>
+— таймер на 10 минут; поставь будильник на 7:30; засеки время; сколько осталось; отмени таймер
+— добавь в список дел <текст>; что в списке дел; отметь выполненным <номер>; очисти выполненные
+— режим диктовки / диктуй; закончить диктовку; голосовые знаки: точка, запятая, новая строка, удали последнее слово
+— брось d20 / 4d6 / d6 плюс 3; подбрось монетку; запиши последние тридцать секунд; запусти тесты
 — создай файл <имя> / создай папку <имя> / создай папку <имя> и в ней файл <имя> — по умолчанию на рабочем столе
 — удали файл <имя> / удали папку <имя> — удаление (в корзину, можно восстановить)
 — удали команду <фраза> / удали игру <фраза> / удали сайт <фраза> — убрать свою команду
@@ -1262,18 +1415,24 @@ def cmd_exit(t):
 
 def cmd_shutdown(t):
     d = CFG["shutdown_delay_sec"]
-    if run_quiet(["shutdown", "/s", "/t", str(d)]) == 0:
-        notify(f"Выключаю компьютер через {d} секунд. Скажи «отмена», чтобы остановить.")
-    else:
-        notify("Не удалось запустить выключение.", ok=False)
+    def run():
+        if run_quiet(["shutdown", "/s", "/t", str(d)]) == 0:
+            journal_add("выключение ПК — необратимо")
+            notify(f"Выключаю компьютер через {d} секунд. Скажи «отмена», чтобы остановить.")
+        else:
+            notify("Не удалось запустить выключение.", ok=False)
+    confirm("выключение", "Подтвердить выключение компьютера?", run, True)
 
 
 def cmd_restart(t):
     d = CFG["shutdown_delay_sec"]
-    if run_quiet(["shutdown", "/r", "/t", str(d)]) == 0:
-        notify(f"Перезагружаю компьютер через {d} секунд. Скажи «отмена», чтобы остановить.")
-    else:
-        notify("Не удалось запустить перезагрузку.", ok=False)
+    def run():
+        if run_quiet(["shutdown", "/r", "/t", str(d)]) == 0:
+            journal_add("перезагрузка ПК — необратимо")
+            notify(f"Перезагружаю компьютер через {d} секунд. Скажи «отмена», чтобы остановить.")
+        else:
+            notify("Не удалось запустить перезагрузку.", ok=False)
+    confirm("перезагрузка", "Подтвердить перезагрузку компьютера?", run, True)
 
 
 def cmd_cancel_shutdown(t):
@@ -1285,15 +1444,36 @@ def cmd_cancel_shutdown(t):
 
 def cmd_notes(t):
     """«открой/покажи заметки», «очисти/удали заметки»."""
+    text = NOTES_PATH.read_text(encoding="utf-8") if NOTES_PATH.is_file() else ""
+    if has(t, "последн"):
+        notify(ju.notes_last(text) or "Заметок пока нет.")
+        return
+    if has(t, "найди"):
+        word = re.sub(r".*?найди\s+(?:в\s+)?заметках?\s*", "", t).strip()
+        hits = ju.notes_search(text, word)
+        notify(". ".join(hits[:10]) if hits else "В заметках ничего не нашёл.")
+        return
+    if has(t, "удали последн"):
+        last = ju.notes_last(text)
+        if not last:
+            notify("Заметок пока нет."); return
+        def drop_last():
+            NOTES_PATH.write_text(ju.notes_drop_last(text), encoding="utf-8")
+            journal_add("удалена последняя заметка", {"kind": "notes_restore", "text": text}, True)
+            notify("Последняя заметка удалена.")
+        confirm("удаление последней заметки", f"Удалить последнюю заметку: {last}?", drop_last)
+        return
     if has(t, "очист", "удали", "удалит", "сотр", "стереть", "стер", "сброс", "удалить"):
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        try:
-            if NOTES_PATH.exists():
-                NOTES_PATH.unlink()
-        except OSError as e:
-            notify(f"Не смог очистить заметки: {e}", ok=False)
-            return
-        notify("Все заметки удалены.")
+        def remove():
+            try:
+                if NOTES_PATH.exists():
+                    old = NOTES_PATH.read_text(encoding="utf-8")
+                    NOTES_PATH.unlink()
+                    journal_add("удалены заметки", {"kind": "notes_restore", "text": old}, True)
+                notify("Все заметки удалены.")
+            except OSError as e:
+                notify(f"Не смог очистить заметки: {e}", ok=False)
+        confirm("удаление заметок", "Удалить все заметки?", remove)
         return
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1625,41 +1805,28 @@ def cmd_dictate(t):
     if not raw:
         notify("Что напечатать? Скажи: «надиктуй привет точка как дела вопрос».", ok=False)
         return
-    try:
-        import jarvis_dictation as d
-    except ImportError as e:
-        notify(f"Модуль диктовки не найден: {e}", ok=False)
-        return
-    text = d.cleanup(raw)
+    text = raw
     # отбрасываем пустоту и мусор вроде «" ,  "» — вставлять нечего
     if not text or not re.search(r"[0-9A-Za-zА-Яа-яЁё]{2,}", text):
         notify("Не расслышал текст для диктовки.", ok=False)
         return
-    if _refine_enabled():  # нейросеть поправит слова и расставит знаки препинания
-        fixed = refine_text(text)
-        if fixed:
-            cleaned = d.cleanup(fixed)
-            # берём только осмысленный результат: есть хотя бы 2 буквы и
-            # не бред вроде «" ,  "» (иначе в пустоту вставляется мусор)
-            if len(re.findall(r"[A-Za-zА-Яа-яЁё]", cleaned)) >= 2:
-                text = cleaned
     dc = CFG.get("dictation", {}) or {}
+    if not js:
+        notify("Модуль ввода недоступен.", ok=False); return
+    win = js.active_window()
+    reason = js.input_block_reason(win)
+    blocked = [str(x).lower() for x in dc.get("blacklist", [])]
+    if reason or any(x and (x in win["title"].lower() or x in win["process"].lower()) for x in blocked):
+        notify(reason or "Это окно находится в чёрном списке диктовки.", ok=False); return
+    if js.window_is_elevated(win.get("hwnd", 0)) and not js.is_running_as_admin():
+        notify(js.ELEVATED_HINT, ok=False); return
+    typed, _buffer, _delete = ju.apply_dictation_commands(text, "", bool(dc.get("autoformat", True))) if ju else (text, text, 0)
+    if not typed:
+        notify("Не расслышал текст для диктовки.", ok=False); return
     try:
-        delay = max(0.0, float(dc.get("delay_sec", 3)))
-    except (TypeError, ValueError):
-        delay = 3.0
-    try:
-        paste_delay = max(0.1, float(dc.get("paste_delay", 0.6)))
-    except (TypeError, ValueError):
-        paste_delay = 0.6
-    restore = bool(dc.get("restore_clipboard", True))
-    if delay > 0:
-        notify(f"Вставляю «{text}» через {delay:g} с — кликни куда нужно…")
-        time.sleep(delay)
-    try:
-        d.type_into_active_window(text, paste_delay=paste_delay,
-                                  restore_clipboard=restore)
-        notify(f"Вставил: {text}")
+        js.type_text(typed, str(dc.get("method", "auto")), int(dc.get("char_delay_ms", 8)),
+                     callback=lambda e: notify("Вставил текст." if not e else f"Не получилось: {e}", ok=not bool(e)))
+        history_add("диктовка", f"диктовка, {len(typed)} символов", "введено")
     except Exception as e:
         log_error("Диктовка", e)
         notify("Не удалось вставить текст.", ok=False)
@@ -1729,6 +1896,12 @@ def _history_trim() -> None:
         lines = HISTORY_PATH.read_text(encoding="utf-8").splitlines()
         if len(lines) > limit:
             HISTORY_PATH.write_text("\n".join(lines[-limit:]) + "\n", encoding="utf-8")
+        max_bytes = int(CFG.get("history", {}).get("max_bytes") or 1048576)
+        if HISTORY_PATH.stat().st_size > max_bytes:
+            rows = HISTORY_PATH.read_text(encoding="utf-8").splitlines()
+            while rows and len("\n".join(rows).encode("utf-8")) > max_bytes:
+                rows.pop(0)
+            HISTORY_PATH.write_text("\n".join(rows) + ("\n" if rows else ""), encoding="utf-8")
     except OSError:
         pass
 
@@ -1762,6 +1935,27 @@ def cmd_history(t):
         except OSError:
             pass
         notify("История запросов очищена.")
+        return
+    if has(t, "повтори последн"):
+        rows = history_lines(20)
+        row = next((r for r in reversed(rows) if r.get("type") == "команда"), None)
+        if not row:
+            notify("В истории нет команды для повтора.", ok=False); return
+        threading.Thread(target=process, args=(_norm(str(row.get("question", ""))),), daemon=True).start()
+        notify("Повторяю последнюю команду.")
+        return
+    if has(t, "что я говорил"):
+        rows = history_lines(5)
+        phrases = [str(r.get("question", "")) for r in rows if r.get("question")]
+        notify("Вы говорили: " + "; ".join(phrases) if phrases else "История запросов пуста.")
+        return
+    if has(t, "найди"):
+        word = re.sub(r".*?найди\s+(?:в\s+)?истории\s*", "", t).strip()
+        try:
+            hits = ju.history_search(HISTORY_PATH.read_text(encoding="utf-8").splitlines(), word)
+        except OSError:
+            hits = []
+        notify(". ".join(str(r.get("question", "")) for r in hits[-10:]) if hits else "В истории ничего не нашёл.")
         return
     if not history_lines(1):
         notify("История запросов пока пуста.")
@@ -1878,8 +2072,6 @@ def reminders_loop() -> None:
         try:
             now = datetime.now()
             rows = reminders_load()
-            if not rows:
-                continue
             changed = False
             for r in list(rows):
                 text, at = str(r.get("text") or ""), str(r.get("at") or "")
@@ -1904,6 +2096,18 @@ def reminders_loop() -> None:
                         _fire_reminder(text)
             if changed:
                 reminders_save(rows)
+            if TIMER_STORE:
+                for row in TIMER_STORE.pop_expired(now):
+                    _fire_reminder(jt.timer_message(row))
+                daily = list(CFG.get("integrations", {}).get("daily_reminders", []) or [])
+                changed_daily = False
+                for i, row in enumerate(daily):
+                    if jt.daily_due(row, now):
+                        _fire_reminder(str(row.get("text") or "ежедневное напоминание"))
+                        daily[i] = jt.daily_mark_fired(row, now)
+                        changed_daily = True
+                if changed_daily:
+                    save_user_config({"integrations": {"daily_reminders": daily}})
         except Exception as e:  # noqa: BLE001
             log_error("Напоминания", e)
 
@@ -2314,7 +2518,360 @@ def cmd_settings(t):
     notify("Открываю настройки.")
     notifier.call(lambda root: jarvis_settings.open_settings(
         root, CFG, save_user_config, AUTOSTART, jarvis_ai,
-        say=lambda text: speaker.say(text) if speaker else None))
+        say=lambda text: speaker.say(text) if speaker else None,
+        history_read=_settings_history_read, history_clear=_settings_history_clear,
+        history_run=lambda text: threading.Thread(target=process, args=(_norm(text),), daemon=True).start()))
+
+
+def _settings_history_read(query: str = "") -> list[dict]:
+    try:
+        rows = [json.loads(x) for x in HISTORY_PATH.read_text(encoding="utf-8").splitlines() if x.strip()]
+        q = _norm(query)
+        if q:
+            rows = [r for r in rows if q in _norm(str(r.get("question", "")) + " " + str(r.get("answer", "")))]
+        return list(reversed(rows))
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log_error("История в настройках", e)
+        return []
+
+
+def _settings_history_clear() -> None:
+    try:
+        HISTORY_PATH.unlink(missing_ok=True)
+        notify("История очищена.")
+    except Exception as e:
+        log_error("Очистка истории", e)
+
+
+# ----- голосовой пакет: система, медиа, продуктивность -----------------------
+
+def _number(t: str) -> int | None:
+    return ju.parse_number_ru(t) if ju else None
+
+
+def _todo_load() -> list:
+    try:
+        return json.loads(TODO_PATH.read_text(encoding="utf-8")) if TODO_PATH.is_file() else []
+    except Exception as e:
+        log_error("Список дел", e)
+        return []
+
+
+def _todo_save(rows: list) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    TODO_PATH.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def cmd_volume(t):
+    def work():
+        old = js.volume_get()
+        if has(t, "выключи звук", "без звука", "замуть"):
+            js.volume_mute(True); result = "Звук выключен."
+        elif has(t, "включи звук", "убери мут"):
+            js.volume_mute(False); result = "Звук включён."
+        elif has(t, "громч", "прибав"):
+            result = f"Громкость: {js.volume_change(10)}%."
+        elif has(t, "тише", "убав"):
+            result = f"Громкость: {js.volume_change(-10)}%."
+        else:
+            n = _number(t)
+            if n is None: raise js.ActionError("не расслышал уровень громкости")
+            result = f"Громкость: {js.volume_set(n)}%."
+        journal_add("громкость", {"kind": "volume", "value": old}, True)
+        notify(result)
+    _async("Громкость", work)
+
+
+def cmd_brightness(t):
+    def work():
+        old = js.brightness_get()
+        if has(t, "ярче"):
+            val = js.brightness_change(10)
+        elif has(t, "темнее"):
+            val = js.brightness_change(-10)
+        else:
+            n = _number(t)
+            if n is None: raise js.ActionError("не расслышал яркость")
+            val = js.brightness_set(n)
+        journal_add("яркость", {"kind": "brightness", "value": old}, True)
+        notify(f"Яркость: {val}%.")
+    _async("Яркость", work)
+
+
+def cmd_power(t):
+    if has(t, "заблокир"):
+        _async("Блокировка ПК", lambda: (js.lock_pc(), journal_add("блокировка ПК")))
+    elif has(t, "гибернац"):
+        confirm("гибернация", "Перевести компьютер в гибернацию?", lambda: _async("Гибернация", js.hibernate_pc))
+    else:
+        confirm("сон", "Перевести компьютер в режим сна?", lambda: _async("Сон", js.sleep_pc))
+
+
+def cmd_processes(t):
+    def work():
+        rows = js.top_processes(5)
+        if not rows:
+            notify("Не удалось получить список процессов.", ok=False); return
+        text = "; ".join(f"{r['name']} — ЦП {r['cpu']:.0f}%, ОЗУ {r['ram_mb']:.0f} МБ" for r in rows[:5])
+        notify("Сейчас больше всего ресурсов используют: " + text)
+    _async("Процессы", work)
+
+
+def cmd_close_any(t):
+    m = re.search(r"\bзакрой\s+(.+)", t)
+    name = (m.group(1) if m else "").strip()
+    alias = (CFG.get("system", {}).get("app_aliases", {}) or {}).get(name, name)
+    def work():
+        count = js.close_process(alias, False)
+        if count:
+            journal_add(f"мягко закрыто: {name}")
+            notify(f"Закрываю {name}.")
+        else:
+            confirm("жёсткое закрытие", f"Окна {name} не найдены. Принудительно завершить процесс?",
+                    lambda: _async("Закрытие процесса", lambda: notify(
+                        f"Завершено процессов: {js.close_process(alias, True)}.")), True)
+    confirm("закрытие приложения", f"Закрыть {name}?", lambda: _async("Закрытие приложения", work), True)
+
+
+def cmd_screenshot(t):
+    _async("Скриншот", lambda: notify("Скриншот сохранён: " + js.screenshot(Path.home() / "Pictures" / "Jarvis")))
+
+
+def cmd_media(t):
+    def work():
+        if has(t, "следующ"):
+            js.media_key("nexttrack"); notify("Следующий трек.")
+        elif has(t, "предыдущ"):
+            js.media_key("prevtrack"); notify("Предыдущий трек.")
+        elif has(t, "что сейчас", "сейчас играет"):
+            title = js.now_playing()
+            notify(title or "Не смог определить, что сейчас играет.")
+        else:
+            js.media_key("playpause"); notify("Переключаю воспроизведение.")
+    _async("Медиа", work)
+
+
+def cmd_app_volume(t):
+    m = re.match(r"(.+?)\s+(?:тише|громче|громкость(?:\s+на)?\s+.*)$", t)
+    app = (m.group(1) if m else "").strip()
+    def work():
+        n = _number(t)
+        delta = 10 if has(t, "громче") else -10 if has(t, "тише") else None
+        name, value = js.app_volume(app, percent=n if delta is None else None, delta=delta)
+        notify(f"Громкость {name}: {value}%.")
+    _async("Громкость приложения", work)
+
+
+def cmd_output(t):
+    alias = "наушники" if has(t, "наушник") else "колонки"
+    _async("Устройство звука", lambda: notify("Звук переключён на " + js.set_default_output(
+        alias, CFG.get("system", {}).get("sound_devices", {}))))
+
+
+def cmd_timer(t):
+    if not TIMER_STORE or not jt:
+        notify("Модуль таймеров недоступен.", ok=False); return
+    if has(t, "сколько осталось"):
+        rows = TIMER_STORE.upcoming()
+        notify("Ближайший таймер через " + ju.format_remaining(rows[0]["remaining"]) if rows else "Активных таймеров нет.")
+        return
+    if has(t, "отмени таймер", "отменить таймер"):
+        hit = TIMER_STORE.cancel("")
+        notify(f"Отменил: {hit.get('text', 'таймер')}." if hit else "Активных таймеров нет.")
+        return
+    plan = jt.parse_timer_phrase(t)
+    if not plan: return
+    if plan["kind"] == "stopwatch":
+        TIMER_STORE.stopwatch_start(); notify("Секундомер запущен."); return
+    row = TIMER_STORE.add_alarm(plan["clock"], plan["text"]) if plan["kind"] == "alarm" else TIMER_STORE.add_timer(plan["seconds"], plan["text"])
+    journal_add("таймер", {"kind": "timer_cancel", "text": row.get("text", "")}, True)
+    notify((f"Будильник поставлен на {plan['clock']}." if plan["kind"] == "alarm" else
+            f"Таймер поставлен на {ju.format_remaining(plan['seconds'])}."))
+
+
+def cmd_todo(t):
+    rows = _todo_load()
+    if has(t, "что в списке", "покажи список", "список дел") and not has(t, "добав"):
+        notify(ju.todo_text(rows)); return
+    if has(t, "очисти выполн"):
+        confirm("очистка выполненных дел", "Удалить выполненные дела?", lambda: (_todo_save(ju.todo_clear_done(rows)), notify("Выполненные дела очищены.")))
+        return
+    if has(t, "отмет", "выполнен"):
+        selector = re.sub(r".*?(?:выполненным|выполнено|отметь)\s*", "", t).strip()
+        new, hit = ju.todo_done(rows, selector)
+        if hit: _todo_save(new); journal_add("отметка дела", {"kind": "todo_restore", "rows": rows}, True); notify(f"Готово: {hit}.")
+        else: notify("Не нашёл такое дело.", ok=False)
+        return
+    m = re.search(r"\bдобав(?:ь|ить)?\s+(?:в )?спис(?:ок)? дел\s+(.+)", t)
+    if m:
+        new = ju.todo_add(rows, m.group(1)); _todo_save(new); journal_add("добавлено дело", {"kind": "todo_restore", "rows": rows}, True); notify("Добавил в список дел.")
+
+
+def cmd_dice(t):
+    try:
+        if has(t, "монет"):
+            notify("Выпало: " + ju.flip_coin()); return
+        r = ju.roll_dice(t)
+        notify(f"Кубики: {', '.join(map(str, r['rolls']))}; модификатор {r['modifier']:+d}; итого {r['total']}.")
+    except Exception as e:
+        notify(f"Не получилось: {e}", ok=False)
+
+
+def cmd_gamebar(t):
+    _async("Game Bar", lambda: (js.gamebar_record_last(), notify("Попросил Game Bar записать последние тридцать секунд.")))
+
+
+def cmd_tests(t):
+    ic = CFG.get("integrations", {})
+    project, command = ic.get("test_project") or str(APP_DIR), ic.get("test_command") or "pytest"
+    timeout = int(ic.get("test_timeout_sec") or 300)
+    def work():
+        r = subprocess.run(command, cwd=project, shell=True, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        DATA_DIR.mkdir(parents=True, exist_ok=True); LAST_TESTS_PATH.write_text((r.stdout or "") + "\n" + (r.stderr or ""), encoding="utf-8")
+        m = re.search(r"(\d+)\s+passed(?:,\s*(\d+)\s+failed)?", r.stdout or "", re.I)
+        notify((f"Тесты: прошло {m.group(1)}, упало {m.group(2) or 0}." if m else f"Тесты завершены, код {r.returncode}. Полный вывод сохранён."), ok=r.returncode == 0)
+    _async("Тесты", work)
+
+
+def cmd_restore_settings(t):
+    backups = sorted((DATA_DIR / "backups").glob("config-*.json"), reverse=True)
+    if not backups:
+        notify("Резервных копий настроек пока нет.", ok=False); return
+    def restore():
+        try:
+            shutil.copy2(backups[0], user_config_path())
+            reload_config()
+            notify("Настройки восстановлены из последней копии.")
+        except Exception as e:
+            log_error("Восстановление настроек", e); notify(f"Не получилось: {e}", ok=False)
+    confirm("восстановление настроек", "Восстановить настройки из последней резервной копии?", restore)
+
+
+def cmd_music_ui(t):
+    title = js.now_playing() if js else None
+    if not title or "youtube music" not in title.lower():
+        notify("Эта функция поддерживается только в активном окне YouTube Music; сейчас оно не найдено.", ok=False)
+        return
+    notify("Автоматическое нажатие кнопок YouTube Music зависит от разметки сайта и в этой версии не поддерживается надёжно.", ok=False)
+
+
+def cmd_clipboard(t):
+    def work():
+        text = js.clipboard_selected_text() if has(t, "выделенн") else js.clipboard_get_text()
+        if not text:
+            notify("В буфере обмена нет текста.", ok=False); return
+        notify(text[:1200], force_speak=True)
+    _async("Буфер обмена", work)
+
+
+def cmd_translate_clipboard(t):
+    def work():
+        text = js.clipboard_get_text()
+        if not text: raise RuntimeError("в буфере обмена нет текста")
+        target = re.sub(r".*?переведи буфер(?:\s+на)?\s*", "", t).strip() or CFG["integrations"]["translation_language"]
+        if not ASSISTANT: raise RuntimeError("нейросеть недоступна")
+        answer = ASSISTANT.ask(f"Переведи на {target}. Верни только перевод:\n{text}")
+        js.clipboard_set_text(answer); notify(answer)
+    _async("Перевод буфера", work)
+
+
+def _send_message(kind: str, t: str) -> None:
+    m = re.search(rf"отправь\s+в\s+{kind}\s+(\S+)\s+(.+)", t)
+    if not m:
+        notify(f"Скажи: «отправь в {kind} контакт текст».", ok=False); return
+    target, text = m.group(1), m.group(2)
+    cfg = CFG["integrations"]
+    def send():
+        if kind == "телеграм":
+            chat = (cfg.get("telegram_contacts") or {}).get(target)
+            ji.telegram_send(cfg.get("telegram_token", ""), str(chat or ""), text)
+        else:
+            hook = (cfg.get("discord_webhooks") or {}).get(target)
+            ji.discord_send(str(hook or ""), text)
+        journal_add(f"сообщение {kind} — необратимо")
+        notify("Сообщение отправлено.")
+    confirm("отправка сообщения", f"Отправить в {kind} для {target}: {text}?", lambda: _async("Отправка сообщения", send), True)
+
+
+def cmd_notifications(t):
+    def work():
+        try:
+            rows = ji.win_notifications_read(5)
+        except Exception:
+            rows = ji.telegram_updates(CFG["integrations"].get("telegram_token", ""), 5)
+        if not rows: notify("Уведомлений нет."); return
+        notify(". ".join(f"{r.get('app') or r.get('from')}: {r.get('title') or r.get('text') or r.get('body')}" for r in rows))
+    _async("Уведомления", work)
+
+
+def cmd_briefing(t):
+    def work():
+        parts = [f"Сегодня {datetime.now():%d.%m.%Y}.", ju.todo_text(_todo_load())]
+        if TIMER_STORE:
+            upcoming = TIMER_STORE.upcoming()
+            if upcoming: parts.append("Ближайший таймер через " + ju.format_remaining(upcoming[0]["remaining"]) + ".")
+        ic = CFG["integrations"]
+        try:
+            lat, lon = float(ic.get("latitude")), float(ic.get("longitude"))
+            parts.insert(1, ji.weather_format(ji.weather_get(lat, lon), ic.get("weather_city") or "вашем городе"))
+        except Exception:
+            pass
+        schedule = CFG.get("schedule") or []
+        if schedule: parts.append("Расписание: " + "; ".join(map(str, schedule)))
+        notify(" ".join(parts))
+    _async("Утренний брифинг", work)
+
+
+def cmd_undo(t):
+    try:
+        rows = [json.loads(x) for x in JOURNAL_PATH.read_text(encoding="utf-8").splitlines() if x.strip()]
+        row = next((r for r in reversed(rows) if r.get("reversible")), None)
+        if not row: notify("Нет обратимого действия."); return
+        undo = row.get("undo") or {}; kind = undo.get("kind")
+        if kind == "volume": js.volume_set(undo["value"])
+        elif kind == "brightness": js.brightness_set(undo["value"])
+        elif kind == "todo_restore": _todo_save(undo["rows"])
+        elif kind == "timer_cancel": TIMER_STORE.cancel(undo.get("text", ""))
+        else: notify("Это действие нельзя автоматически отменить.", ok=False); return
+        journal_add("откат: " + row.get("action", "")); notify("Последнее действие отменено.")
+    except Exception as e:
+        log_error("Откат", e); notify(f"Не получилось: {e}", ok=False)
+
+
+def _dictation_stop(reason: str = "Диктовка закончена.") -> None:
+    STATE.dictation_mode = False
+    STATE.dictation_buffer = ""
+    STATE.dictation_last_chunk = ""
+    notify(reason)
+
+
+def _dictation_feed(text: str) -> None:
+    """Одна фраза непрерывной диктовки. Команды сюда не доходят."""
+    dc = CFG.get("dictation", {}) or {}
+    if not js or not ju:
+        _dictation_stop("Диктовка недоступна."); return
+    win = js.active_window()
+    reason = js.input_block_reason(win)
+    blocked = [str(x).lower() for x in dc.get("blacklist", [])]
+    if reason or any(x and (x in win["title"].lower() or x in win["process"].lower()) for x in blocked):
+        notify(reason or "Это окно находится в чёрном списке диктовки.", ok=False); return
+    if js.window_is_elevated(win.get("hwnd", 0)) and not js.is_running_as_admin():
+        notify(js.ELEVATED_HINT, ok=False); return
+    typed, new_buffer, delete = ju.apply_dictation_commands(
+        text, STATE.dictation_buffer, bool(dc.get("autoformat", True)))
+    STATE.dictation_buffer = new_buffer
+    STATE.dictation_last_seen = time.time()
+    if delete:
+        js.type_text("\b" * delete, "unicode", int(dc.get("char_delay_ms", 8)))
+    if typed:
+        STATE.dictation_last_chunk = typed
+        js.type_text(typed, str(dc.get("method", "auto")), int(dc.get("char_delay_ms", 8)),
+                     callback=lambda e: notify(f"Не получилось: {e}", ok=False) if e else None)
+    history_add("диктовка", f"диктовка, {len(typed)} символов", "введено")
 
 
 def U(key):  # ссылка из config.urls
@@ -2329,14 +2886,42 @@ COMMANDS = [
     Cmd(lambda t: is_word(t, "выход", "выйти"), cmd_exit, False),
     Cmd(lambda t: is_word(t, "отмена", "отмени", "отменить") and not has(t, "напоминани"),
         cmd_cancel_shutdown, False),
+    Cmd(lambda t: has(t, "восстанови настройки"), cmd_restore_settings, False),
     Cmd(lambda t: has(t, "настройк"), cmd_settings, False),
+    Cmd(lambda t: has(t, "лайкни трек", "добавь в плейлист"), cmd_music_ui, False),
+    Cmd(lambda t: has(t, "отмени последнее действие"), cmd_undo, False),
+    Cmd(lambda t: has(t, "доброе утро", "утренний брифинг"), cmd_briefing, False),
+    Cmd(lambda t: has(t, "прочитай уведомлен"), cmd_notifications, False),
+    Cmd(lambda t: has(t, "переведи буфер"), cmd_translate_clipboard, False),
+    Cmd(lambda t: has(t, "прочитай буфер", "прочитай выделенн"), cmd_clipboard, False),
+    Cmd(lambda t: has(t, "отправь в телеграм"), lambda t: _send_message("телеграм", t), False),
+    Cmd(lambda t: has(t, "отправь в дискорд"), lambda t: _send_message("дискорд", t), False),
+    Cmd(lambda t: re.match(r".+\s+(?:тише|громче|громкость\s+на)", t) is not None, cmd_app_volume, False),
+    Cmd(lambda t: has(t, "громч", "тише", "убав", "прибав") or has(t, "громкость")
+                  or has(t, "выключи звук", "включи звук"), cmd_volume, False),
+    Cmd(lambda t: has(t, "ярче", "темнее") or has(t, "яркость"), cmd_brightness, False),
+    Cmd(lambda t: has(t, "заблокир") or has(t, "режим сна", "гибернац"), cmd_power, False),
+    Cmd(lambda t: has(t, "что запущено", "грузит процессор"), cmd_processes, False),
+    Cmd(lambda t: has(t, "сделай скриншот", "снимок экрана"), cmd_screenshot, False),
+    Cmd(lambda t: has(t, "запиши последние тридцать секунд", "запиши последние 30 секунд"), cmd_gamebar, True),
+    Cmd(lambda t: has(t, "запусти тесты"), cmd_tests, False),
+    Cmd(lambda t: has(t, "брось") and ("d" in t or has(t, "куб")), cmd_dice, False),
+    Cmd(lambda t: has(t, "подбрось монет"), cmd_dice, False),
+    Cmd(lambda t: has(t, "список дел") or has(t, "добав") and has(t, "список")
+                  or has(t, "очисти выполн") or has(t, "отметь выполн"), cmd_todo, False),
+    Cmd(lambda t: has(t, "таймер", "будильник", "секундомер", "засеки", "сколько осталось")
+                  or has(t, "отмени таймер"), cmd_timer, False),
+    Cmd(lambda t: has(t, "переключи звук") and has(t, "наушник", "колонк"), cmd_output, False),
+    Cmd(lambda t: has(t, "что сейчас играет", "сейчас играет") or is_word(t, "пауза", "играй")
+                  or has(t, "следующ", "предыдущ") and has(t, "трек"), cmd_media, False),
+    Cmd(lambda t: has(t, "закрой") and not has(t, "браузер", "хром", "стим", "дискорд", "телеграм", "музык"), cmd_close_any, False),
     # раньше своих команд: «загугли кс2» должно искать, а не запускать игру
     Cmd(lambda t: bool(SEARCH_RE.search(t)) and not TRACK_RE.search(t), cmd_search, False),
     Cmd(lambda t: _custom_match(t) is not None, cmd_custom, False),  # свои команды — раньше встроенных
     Cmd(lambda t: has(t, "выключ") and is_pc(t), cmd_shutdown, True),
     Cmd(lambda t: has(t, "перезагруз") and is_pc(t), cmd_restart, True),
     Cmd(lambda t: has(t, "заметк", "запис") and has(t, "откр", "покаж", "показ", "прочита",
-                                                      "прочит", "посмотр", "читай", "очист",
+                                                      "прочит", "посмотр", "читай", "найди", "последн", "очист",
                                                       "удали", "удалит", "сотр", "стереть",
                                                       "стер", "сброс", "удалить"),
         cmd_notes, False),
@@ -2357,7 +2942,7 @@ COMMANDS = [
     # «открой файл / папку / документ» — не сайт, а файл; раньше игр, «учеб» и «открой-сайт»
     Cmd(wants_open_item, cmd_open, False),
     Cmd(is_help, cmd_help, False),
-    Cmd(lambda t: has(t, "истори"), cmd_history, False),  # история запросов / очисти историю
+    Cmd(lambda t: has(t, "истори", "повтори последн", "что я говорил"), cmd_history, False),
     Cmd(lambda t: has(t, "напоминани"), cmd_reminders, False),  # покажи/удали напоминания
     Cmd(lambda t: has(t, "напомни"), cmd_remind, False),        # напомни мне …
     Cmd(lambda t: is_word(t, "голос"), cmd_voice, False),
@@ -2441,6 +3026,23 @@ def _chain_run(parts: list, addressed: bool) -> bool:
 
 def process(text: str, refined: bool = False) -> None:
     P = CFG["phrases"]
+    if STATE.pending_confirm:
+        _process_confirmation(text)
+        return
+    if STATE.dictation_mode:
+        mode = ju.dictation_mode_detect(text) if ju else None
+        if mode == "stop":
+            _dictation_stop()
+            return
+        if ju and ju.is_dictation_text(True, text):
+            _dictation_feed(text)
+            return
+    elif ju and ju.dictation_mode_detect(text) == "start":
+        STATE.dictation_mode = True
+        STATE.dictation_last_seen = time.time()
+        STATE.dictation_buffer = ""
+        notify("Режим диктовки включён. Скажите «закончить диктовку», когда завершите.")
+        return
     if not STATE.listening:
         if P["resume"] in text:
             STATE.listening = True
@@ -2493,8 +3095,6 @@ def process(text: str, refined: bool = False) -> None:
         for cmd in COMMANDS:
             if cmd.run is cmd_dictate and cmd.match(text):
                 cmd.run(text)
-                if addressed:
-                    history_add("команда", text, "выполнена")
                 return
     if ask and jarvis_ai.is_question(ask) and not is_help(ask) and not _local_first:
         ask_ai(ask)
@@ -2507,7 +3107,7 @@ def process(text: str, refined: bool = False) -> None:
             else:
                 cmd.run(text)
                 # самим командам журналировать себя важнее (в них уже есть свой ответ)
-                if addressed and cmd.run not in (cmd_history, cmd_remind, cmd_reminders):
+                if addressed and cmd.run not in (cmd_history, cmd_remind, cmd_reminders, cmd_dictate):
                     history_add("команда", text, "выполнена")
             return
 
@@ -2571,6 +3171,9 @@ def main_loop() -> None:
         try:
             audio = audio_q.get(timeout=0.5)
         except queue.Empty:
+            if STATE.dictation_mode and ju and ju.dictation_idle_expired(
+                    STATE.dictation_last_seen, time.time(), CFG.get("dictation", {}).get("idle_timeout_sec", 120)):
+                _dictation_stop("Режим диктовки выключен: две минуты тишины.")
             continue
         try:
             text = _norm(recognizer.recognize_google(audio, language=CFG["language"]))
@@ -2593,6 +3196,10 @@ def main_loop() -> None:
 # ============================================================================
 
 def print_check() -> None:
+    try:
+        psutil_ok = bool(js and js.top_processes(1))
+    except Exception:
+        psutil_ok = False
     rows = [
         ("Chrome", find_chrome()),
         ("Chrome-профиль (основной)", chrome_profile("main")),
@@ -2610,6 +3217,12 @@ def print_check() -> None:
         ("Нейросеть", (f"{CFG['ai']['provider']}, ключ {'задан' if jarvis_ai and jarvis_ai.resolve(CFG['ai'])[2] else 'НЕ задан'}"
                        if CFG["ai"]["enabled"] else "выключена (настройки → Нейросеть)") if jarvis_ai else None),
         ("ytmusicapi", "установлен" if YTMusic else None),
+        ("pycaw", "установлен" if js and js._endpoint_volume() is not None else None),
+        ("psutil", "установлен" if psutil_ok else None),
+        ("Яркость", "доступна" if js and _check_brightness() else None),
+        ("Горячая клавиша", CFG.get("integrations", {}).get("hotkey") or None),
+        ("Telegram", "токен задан" if CFG.get("integrations", {}).get("telegram_token") else None),
+        ("Discord", "webhook задан" if CFG.get("integrations", {}).get("discord_webhooks") else None),
         ("Папка данных", str(DATA_DIR)),
     ]
     lines = [f"  {'✓' if val else '✗'} {name:28} {val or 'не найдено'}" for name, val in rows]
@@ -2617,6 +3230,14 @@ def print_check() -> None:
         if not CFG["urls"].get(k):
             lines.append(f"  ! urls.{k} не задан (config.json) — команда работать не будет")
     show_text("check.txt", "\n".join(lines))
+
+
+def _check_brightness() -> bool:
+    try:
+        js.brightness_get()
+        return True
+    except Exception:
+        return False
 
 
 def list_voices() -> None:
@@ -2671,7 +3292,7 @@ def ask_test(question: str) -> None:
 
 
 def main() -> None:
-    global notifier, speaker
+    global notifier, speaker, HOTKEY
     ap = argparse.ArgumentParser(description="Джарвис — голосовой ассистент")
     ap.add_argument("--check", action="store_true", help="показать, что найдено на этом ПК")
     ap.add_argument("--list-voices", action="store_true", help="список голосов TTS")
@@ -2698,6 +3319,11 @@ def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     notifier = Notifier()
     speaker = Speaker()
+    if js:
+        HOTKEY = js.HotkeyListener(
+            lambda: process(CFG["phrases"]["pause"] if STATE.listening else CFG["phrases"]["resume"]),
+            lambda message: notify(message, ok=False))
+        HOTKEY.start(CFG.get("integrations", {}).get("hotkey", "ctrl+alt+j"))
 
     ready = threading.Event()
     threading.Thread(target=listener_loop, args=(ready,), daemon=True).start()
@@ -2712,6 +3338,8 @@ def main() -> None:
         pass
     finally:
         STATE.stop.set()
+        if HOTKEY:
+            HOTKEY.stop(wait=1.0)
         waited = 0.0
         while speaker.busy.is_set() and waited < 5:  # дать договорить последнюю фразу
             time.sleep(0.1)

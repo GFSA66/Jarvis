@@ -6,3 +6,10 @@ pyautogui
 pywin32
 ytmusicapi
 customtkinter>=5.2
+pycaw
+psutil
+screen-brightness-control
+comtypes
+keyring
+winsdk
+requests
