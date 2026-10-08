@@ -55,11 +55,12 @@ AI_STYLES = [("film", "Как в кино — учтивый, с характе�
 
 # --- оформление (JARVIS HUD) ------------------------------------------------
 FONT = "Segoe UI"
-ACCENT, ACCENT_H = "#00d4ff", "#0099bb"
+WINDOW_BG, HEADER_BG = "#07111f", "#0b1d30"
+ACCENT, ACCENT_H = "#00d4ff", "#00a8cc"
 DANGER, DANGER_H = "#c94a4a", "#a33a3a"
 OK_COLOR, ERR_COLOR, MUTED = "#3ecf8e", "#ff6b6b", "#8b97a6"
-CARD, ROW_A, ROW_B = "#111927", "#0d1420", "#16202f"
-CARD_BORDER = "#1e3a4a"
+CARD, ROW_A, ROW_B = "#101d2e", "#0b1625", "#14253a"
+CARD_BORDER = "#234965"
 TITLE_COLOR = "#00d4ff"
 GHOST_H = "#2b3646"
 
@@ -399,22 +400,35 @@ class SettingsWindow:
         self.history_read, self.history_clear, self.history_run = history_read, history_clear, history_run
         w = self.win = ctk.CTkToplevel(root)
         w.title("Джарвис — настройки")
-        w.geometry("940x700")
-        w.minsize(800, 580)
+        w.geometry("980x730")
+        w.minsize(840, 610)
+        w.configure(fg_color=WINDOW_BG)
         _set_icon(w)
 
-        head = ctk.CTkFrame(w, fg_color="transparent")
-        head.pack(fill="x", padx=22, pady=(16, 6))
-        ctk.CTkLabel(head, text="Джарвис", font=_font(24, True)).pack(side="left")
-        ctk.CTkLabel(head, text="настройки применяются сразу после сохранения", font=_font(12),
-                     text_color=MUTED).pack(side="left", padx=(12, 0), pady=(8, 0))
+        head = ctk.CTkFrame(w, fg_color=HEADER_BG, corner_radius=18,
+                            border_width=1, border_color=CARD_BORDER)
+        head.pack(fill="x", padx=18, pady=(18, 10))
+        mark = ctk.CTkLabel(head, text="J", width=42, height=42, corner_radius=21,
+                            fg_color=ACCENT, text_color="#04141a", font=_font(20, True))
+        mark.pack(side="left", padx=(18, 12), pady=14)
+        title_box = ctk.CTkFrame(head, fg_color="transparent")
+        title_box.pack(side="left", fill="x", expand=True, pady=12)
+        ctk.CTkLabel(title_box, text="Центр управления Джарвисом", font=_font(22, True),
+                     text_color="#f0f8ff").pack(anchor="w")
+        ctk.CTkLabel(title_box, text="Изменения применяются после сохранения • Ctrl+S — сохранить",
+                     font=_font(12), text_color=MUTED).pack(anchor="w", pady=(2, 0))
+        ctk.CTkLabel(head, text="●  ГОТОВ", font=_font(12, True), text_color=OK_COLOR,
+                     fg_color="#102b29", corner_radius=12, padx=13, pady=7).pack(
+                         side="right", padx=18, pady=14)
 
         tabs = self.tabs = ctk.CTkTabview(
-            w, corner_radius=12, segmented_button_selected_color=ACCENT,
+            w, fg_color="#091522", corner_radius=16, border_width=1, border_color=CARD_BORDER,
+            segmented_button_fg_color="#12253a", segmented_button_selected_color=ACCENT,
             segmented_button_selected_hover_color=ACCENT_H,
+            segmented_button_unselected_color="#12253a",
             segmented_button_unselected_hover_color=GHOST_H)
         tabs._segmented_button.configure(font=_font(13, True))
-        tabs.pack(fill="both", expand=True, padx=16, pady=(0, 4))
+        tabs.pack(fill="both", expand=True, padx=18, pady=(0, 8))
 
         names = ["Мои команды", "Игры Steam", "Сайты", "Ссылки", "Общие",
                  "Безопасность", "Уведомления", "Интеграции", "Диктовка", "История"]
@@ -458,20 +472,22 @@ class SettingsWindow:
         self.t_games.load(sorted(cfg["games"].items()))
         self.t_sites.load(sorted(cfg["sites"].items()))
 
-        bottom = ctk.CTkFrame(w, fg_color="transparent")
-        bottom.pack(fill="x", padx=22, pady=(4, 16))
-        self.status = ctk.CTkLabel(bottom, text="", font=_font(13), anchor="w")
-        self.status.pack(side="left", fill="x", expand=True)
+        bottom = ctk.CTkFrame(w, fg_color=HEADER_BG, corner_radius=14,
+                              border_width=1, border_color=CARD_BORDER)
+        bottom.pack(fill="x", padx=18, pady=(0, 18))
+        self.status = ctk.CTkLabel(bottom, text="Готово к настройке", font=_font(13),
+                                   text_color=MUTED, anchor="w")
+        self.status.pack(side="left", fill="x", expand=True, padx=(16, 8), pady=10)
         _button(bottom, "Закрыть", w.destroy, width=100).pack(side="right")
         self.btn_save = _button(bottom, "Сохранить", self.save, "accent", 120)
-        self.btn_save.pack(side="right", padx=(0, 8))
+        self.btn_save.pack(side="right", padx=(0, 10), pady=8)
+        bottom.winfo_children()[-1].pack_configure(pady=8)
         w.bind("<Control-s>", lambda e: self.save())
 
         w.lift()
         w.focus_force()
 
     # --- вкладки ---------------------------------------------------------
-    @staticmethod
     @staticmethod
     def _card(parent, title: str, row: int) -> ctk.CTkFrame:
         card = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=14,

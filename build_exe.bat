@@ -19,6 +19,7 @@ if not exist ".venv\Scripts\python.exe" (
 
 rem jarvis.ico next to this file is used as the exe icon. Without it the exe is built with the default icon.
 rem --collect-all customtkinter: the library keeps themes and fonts in its own files; without them the settings window will not open.
+rem --collect-all piper: includes bundled espeak-ng-data phoneme tables required by Piper at runtime.
 rem --noconsole: no black window (errors go to %USERPROFILE%\.jarvis\errors.log). Remove it to debug.
 set "ICON_ARGS="
 if exist "jarvis.ico" set "ICON_ARGS=--icon jarvis.ico --add-data jarvis.ico;."
@@ -29,6 +30,7 @@ if not exist "jarvis.ico" echo [Jarvis] jarvis.ico not found - building with the
     %ICON_ARGS% ^
     --collect-all customtkinter ^
     --collect-all speech_recognition ^
+    --collect-all piper ^
     --collect-data ytmusicapi ^
     --collect-data jarvis_settings ^
     --collect-data jarvis_utils ^
@@ -38,7 +40,6 @@ if not exist "jarvis.ico" echo [Jarvis] jarvis.ico not found - building with the
     --hidden-import pyaudiowpatch ^
     --hidden-import pyttsx3.drivers ^
     --hidden-import pyttsx3.drivers.sapi5 ^
-    --hidden-import piper ^
     --hidden-import onnxruntime ^
     --hidden-import win32timezone ^
     --hidden-import pycaw ^
@@ -47,7 +48,6 @@ if not exist "jarvis.ico" echo [Jarvis] jarvis.ico not found - building with the
     --hidden-import psutil ^
     --hidden-import screen_brightness_control ^
     --hidden-import keyring ^
-    --hidden-import winsdk ^
     --hidden-import requests ^
     --hidden-import jarvis_utils ^
     --hidden-import jarvis_system ^

@@ -35,6 +35,36 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote_plus
 
+
+_STARTUP_DATA_DIR = Path(os.environ.get("JARVIS_HOME") or (Path.home() / ".jarvis"))
+_STARTUP_ERROR_LOG = _STARTUP_DATA_DIR / "errors.log"
+
+
+def _show_startup_error(context: str, exc: BaseException) -> None:
+    """Показать и записать ошибку, возникшую до запуска окна/голоса.
+
+    Это особенно важно для windowed-версии PyInstaller: у неё нет консоли,
+    поэтому необработанная ошибка иначе выглядит как мгновенное закрытие exe.
+    """
+    details = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    try:
+        _STARTUP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with _STARTUP_ERROR_LOG.open("a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {context}\n{details}\n")
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            f"Джарвис не смог запуститься.\n\n{exc}\n\n"
+            f"Подробности: {_STARTUP_ERROR_LOG}",
+            "Джарвис — ошибка запуска",
+            0x10,
+        )
+    except Exception:
+        pass
+
+
 if sys.platform != "win32":
     sys.exit("Джарвис работает только на Windows.")
 
@@ -78,8 +108,11 @@ try:
     import win32con
     import win32gui
 except ImportError as _e:
-    sys.exit(f"Не хватает библиотеки: {_e.name}\n"
-             f"Установи зависимости:  pip install -r requirements.txt")
+    _startup_exc = RuntimeError(
+        f"Не хватает библиотеки: {_e.name}\nУстанови зависимости: pip install -r requirements.txt"
+    )
+    _show_startup_error("Критический импорт", _startup_exc)
+    raise SystemExit(str(_startup_exc)) from _e
 
 try:
     import customtkinter as ctk
@@ -1316,7 +1349,7 @@ def is_word(text: str, *words: str) -> bool:
 
 
 def is_help(t: str) -> bool:
-    return "что ты умеешь" in t or "список команд" in t or t.strip() == "помощь"
+    return "список команд" in t or t.strip() == "помощь"
 
 
 def is_pc(text: str) -> bool:
@@ -2924,7 +2957,7 @@ COMMANDS = [
     Cmd(lambda t: has(t, "запиши последние тридцать секунд", "запиши последние 30 секунд"), cmd_gamebar, True),
     Cmd(lambda t: has(t, "запусти тесты"), cmd_tests, False),
     Cmd(lambda t: has(t, "создай файл возможностей", "создай список возможностей",
-                        "создай файл со всеми возможностями", "выгрузи возможности"), cmd_export_capabilities, False),
+                        "создай файл со всеми возможностями", "выгрузи возможности", "что ты умеешь"), cmd_export_capabilities, False),
     Cmd(lambda t: has(t, "брось") and ("d" in t or has(t, "куб")), cmd_dice, False),
     Cmd(lambda t: has(t, "подбрось монет"), cmd_dice, False),
     Cmd(lambda t: has(t, "список дел") or has(t, "добав") and has(t, "список")
@@ -3179,7 +3212,17 @@ def listener_loop(ready: threading.Event) -> None:
                     pass
     except Exception as e:
         log_error("Микрофон", e)
-        print("Не удалось открыть микрофон. Проверь, что он подключён и разрешён в настройках Windows.")
+        message = "Не удалось открыть микрофон. Проверь, что он подключён и разрешён в настройках Windows."
+        print(message)
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                f"{message}\n\n{e}\n\nПодробности: {ERROR_LOG}",
+                "Джарвис — микрофон недоступен",
+                0x10,
+            )
+        except Exception:
+            pass
         STATE.stop.set()
     finally:
         ready.set()
@@ -3372,4 +3415,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as e:  # noqa: BLE001
+        _show_startup_error("Критическая ошибка запуска", e)
+        raise

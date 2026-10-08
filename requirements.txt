@@ -11,5 +11,5 @@ psutil
 screen-brightness-control
 comtypes
 keyring
-winsdk
+# Необязательно: чтение уведомлений Windows — pip install winsdk
 requests
