@@ -354,13 +354,16 @@ def screenshot(dest_dir) -> str:
 #  Медиаклавиши и «что сейчас играет»
 # ============================================================================
 
-VK_MEDIA_PLAY_PAUSE, VK_MEDIA_NEXT, VK_MEDIA_PREV = 0xB3, 0xB1, 0xB0
+VK_MEDIA_NEXT_TRACK = 0xB0
+VK_MEDIA_PREV_TRACK = 0xB1
+VK_MEDIA_STOP = 0xB2
+VK_MEDIA_PLAY_PAUSE = 0xB3
 
 
 def media_key(key: str) -> None:
     """playpause | next | prev — через системные медиаклавиши (работают глобально)."""
-    vk = {"playpause": VK_MEDIA_PLAY_PAUSE, "nexttrack": VK_MEDIA_NEXT,
-          "prevtrack": VK_MEDIA_PREV}.get(key)
+    vk = {"playpause": VK_MEDIA_PLAY_PAUSE, "nexttrack": VK_MEDIA_NEXT_TRACK,
+          "prevtrack": VK_MEDIA_PREV_TRACK}.get(key)
     if vk is None:
         raise ActionError(f"неизвестная медиаклавиша: {key}")
     _press_key(vk)
@@ -566,7 +569,8 @@ def app_volume(app_query: str, percent: int | None = None,
 INPUT_UNICODE = 1
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
-VK_BACK, VK_CONTROL, VK_V = 0x08, 0x11, 0x56
+VK_BACK, VK_CONTROL, VK_V, VK_C, VK_INSERT = 0x08, 0x11, 0x56, 0x43, 0x2D
+VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN = 0x12, 0x10, 0x5B, 0x5C
 
 
 class _KEYBDINPUT(ctypes.Structure):
@@ -639,36 +643,52 @@ CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
 
 
-def clipboard_get_text() -> str | None:
+def _clipboard_open(user32, attempts: int = 10, delay: float = 0.05) -> bool:
+    for _ in range(attempts):
+        if user32.OpenClipboard(None):
+            return True
+        time.sleep(delay)
+    return False
+
+
+def get_clipboard_text() -> str:
+    """Прочитать CF_UNICODETEXT с повторами. ActionError содержит причину."""
     user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
-    if not user32.OpenClipboard(None):
-        return None
+    if not _clipboard_open(user32):
+        raise ActionError("нет доступа к буферу обмена: он занят другой программой")
     try:
         if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
-            return None
+            raise ActionError("в буфере обмена нет текстового содержимого")
         h = user32.GetClipboardData(CF_UNICODETEXT)
         if not h:
-            return None
+            raise ActionError("не удалось прочитать текст из буфера обмена")
         p = kernel32.GlobalLock(h)
         if not p:
-            return None
+            raise ActionError("не удалось открыть текст в буфере обмена")
         try:
             raw = ctypes.string_at(p, kernel32.GlobalSize(h))
-            return raw.decode("utf-16-le").rstrip("\x00")
+            text = raw.decode("utf-16-le").rstrip("\x00")
+            if not text.strip():
+                raise ActionError("в буфере обмена нет текста")
+            return text
         finally:
             kernel32.GlobalUnlock(h)
     finally:
         user32.CloseClipboard()
 
 
+def clipboard_get_text() -> str | None:
+    """Совместимый API: None при пустом/недоступном буфере."""
+    try:
+        return get_clipboard_text()
+    except ActionError:
+        return None
+
+
 def clipboard_set_text(text: str) -> bool:
     user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
     data = (text or "").encode("utf-16-le") + b"\x00\x00"
-    for _ in range(8):
-        if user32.OpenClipboard(None):
-            break
-        time.sleep(0.07)
-    else:
+    if not _clipboard_open(user32):
         return False
     try:
         user32.EmptyClipboard()
@@ -686,19 +706,36 @@ def clipboard_set_text(text: str) -> bool:
         user32.CloseClipboard()
 
 
-def clipboard_selected_text() -> str | None:
-    """Скопировать выделение Ctrl+C и вернуть прежнее текстовое содержимое буфера."""
+def _release_modifiers(user32) -> None:
+    for vk in (VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN):
+        user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+
+
+def _send_shortcut(user32, key: int) -> None:
+    user32.keybd_event(VK_CONTROL, 0, 0, 0)
+    user32.keybd_event(key, 0, 0, 0)
+    user32.keybd_event(key, 0, KEYEVENTF_KEYUP, 0)
+    user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+
+
+def clipboard_selected_text() -> str:
+    """Скопировать выделение Ctrl+C/Ctrl+Insert и восстановить прежний текстовый буфер."""
     old = clipboard_get_text()
     user32 = ctypes.windll.user32
-    _send_vk(user32, VK_CONTROL)
-    _send_vk(user32, ord("C"))
-    _send_vk(user32, ord("C"), 2)
-    _send_vk(user32, VK_CONTROL, 2)
-    time.sleep(0.15)
-    selected = clipboard_get_text()
-    if old is not None:
-        clipboard_set_text(old)
-    return selected
+    sequence = user32.GetClipboardSequenceNumber()
+    _release_modifiers(user32)
+    try:
+        for key in (VK_C, VK_INSERT):
+            _send_shortcut(user32, key)
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                if user32.GetClipboardSequenceNumber() != sequence:
+                    return get_clipboard_text()
+                time.sleep(0.025)
+        raise ActionError("ничего не выделено или окно не даёт скопировать")
+    finally:
+        if old is not None and not clipboard_set_text(old):
+            raise ActionError("прочитал выделенное, но не смог восстановить прежний буфер")
 
 
 def paste_via_clipboard(text: str, restore: bool = True,

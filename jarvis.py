@@ -29,11 +29,12 @@ import threading
 import time
 import traceback
 import webbrowser
-from collections import namedtuple
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote_plus
+
+import jarvis_routing
 
 
 _STARTUP_DATA_DIR = Path(os.environ.get("JARVIS_HOME") or (Path.home() / ".jarvis"))
@@ -64,6 +65,15 @@ def _show_startup_error(context: str, exc: BaseException) -> None:
     except Exception:
         pass
 
+
+if "--match" in sys.argv and sys.platform != "win32":
+    try:
+        phrase = sys.argv[sys.argv.index("--match") + 1]
+    except IndexError:
+        print("Использование: jarvis.py --match \"фраза\"")
+        raise SystemExit(2)
+    print(jarvis_routing.format_diagnosis(phrase))
+    raise SystemExit(0)
 
 if sys.platform != "win32":
     sys.exit("Джарвис работает только на Windows.")
@@ -1379,7 +1389,15 @@ TRACK_RE = re.compile(r"\b(?:включи|поставь|найди)\s+(?:тре
 # «загугли X», «найди X», «найди в интернете X» (но «найди трек X» — это музыка, см. TRACK_RE)
 SEARCH_RE = re.compile(
     r"\b(?:загугл\w*|погугл\w*|найди(?:те)?)\b\s*(?:в\s+(?:интернете|гугле|google|сети)\s+)?(.*)")
-Cmd = namedtuple("Cmd", "match run play_only")
+class Cmd:
+    """Команда с именем для диагностики порядка COMMANDS."""
+
+    def __init__(self, match, run, play_only: bool, name: str | None = None):
+        self.match = match
+        self.run = run
+        self.play_only = play_only
+        raw = name or getattr(run, "__name__", "builtin")
+        self.name = raw.removeprefix("cmd_") if raw != "<lambda>" else "builtin"
 
 
 def commands_text() -> str:
@@ -1406,12 +1424,12 @@ def commands_text() -> str:
 — запиши <текст> / заметка <текст> — сохранить заметку; открой заметки — показать; очисти заметки — удалить все ({NOTES_PATH})
 — громче / тише / громкость на 30; ярче / темнее / яркость 70; выключи или включи звук
 — заблокируй ПК; режим сна; гибернация; что запущено; что грузит процессор; сделай скриншот
-— пауза / играй; следующий или предыдущий трек; что сейчас играет; переключи звук на наушники / колонки
+— пауза / играй; следующий/дальше или предыдущий/назад трек; что сейчас играет; переключи звук на наушники / колонки
 — <приложение> тише / громче / громкость на 30; закрой <приложение>
 — таймер на 10 минут; поставь будильник на 7:30; засеки время; сколько осталось; отмени таймер
 — добавь в список дел <текст>; что в списке дел; отметь выполненным <номер>; очисти выполненные
 — режим диктовки / диктуй; закончить диктовку; голосовые знаки: точка, запятая, новая строка, удали последнее слово
-— брось d20 / 4d6 / d6 плюс 3; подбрось монетку; запиши последние тридцать секунд; запусти тесты
+— брось d20 / 5д20 / пять дэ двадцать / три кубика по шесть / d6 плюс 3; подбрось монетку; запиши последние тридцать секунд; запусти тесты
 — создай файл <имя> / создай папку <имя> / создай папку <имя> и в ней файл <имя> — по умолчанию на рабочем столе
 — удали файл <имя> / удали папку <имя> — удаление (в корзину, можно восстановить)
 — удали команду <фраза> / удали игру <фраза> / удали сайт <фраза> — убрать свою команду
@@ -2553,6 +2571,8 @@ def run_target(target: str, label: str) -> None:
 
 
 def _custom_match(t):
+    if jarvis_routing.close_verb(t):
+        return None
     cmds = sorted(CFG["commands"], key=lambda c: -len(c["phrase"]))  # длинные фразы приоритетнее
     return next((c for c in cmds if has(t, c["phrase"])), None)
 
@@ -2671,8 +2691,8 @@ def cmd_processes(t):
 
 
 def cmd_close_any(t):
-    m = re.search(r"\bзакрой\s+(.+)", t)
-    name = (m.group(1) if m else "").strip()
+    m = re.search(r"\b(?:закр\w*|выключ\w*|останов\w*|заверш\w*)\s+(.+)", t)
+    name = (m.group(1) if m else re.sub(r"\b(?:закр\w*|выключ\w*|останов\w*|заверш\w*)\b", "", t)).strip(" ,.!?")
     alias = (CFG.get("system", {}).get("app_aliases", {}) or {}).get(name, name)
     def work():
         count = js.close_process(alias, False)
@@ -2692,9 +2712,9 @@ def cmd_screenshot(t):
 
 def cmd_media(t):
     def work():
-        if has(t, "следующ"):
+        if has(t, "следующ", "дальше", "вперед"):
             js.media_key("nexttrack"); notify("Следующий трек.")
-        elif has(t, "предыдущ"):
+        elif has(t, "предыдущ", "прошл", "назад", "верни"):
             js.media_key("prevtrack"); notify("Предыдущий трек.")
         elif has(t, "что сейчас", "сейчас играет"):
             title = js.now_playing()
@@ -2765,9 +2785,19 @@ def cmd_dice(t):
         if has(t, "монет"):
             notify("Выпало: " + ju.flip_coin()); return
         r = ju.roll_dice(t)
-        notify(f"Кубики: {', '.join(map(str, r['rolls']))}; модификатор {r['modifier']:+d}; итого {r['total']}.")
-    except Exception as e:
-        notify(f"Не получилось: {e}", ok=False)
+        for value in r["rolls"][:20]:
+            notify(str(value), force_speak=True)
+        if len(r["rolls"]) > 20:
+            notify("И так далее.", force_speak=True)
+        result = f"Выпало: {', '.join(map(str, r['rolls']))}. Сумма {sum(r['rolls'])}."
+        if r["mod"]:
+            result += f" С модификатором {r['total']}."
+        notify(result, force_speak=True)
+    except ValueError as e:
+        notify(str(e), ok=False)
+    except Exception as e:  # noqa: BLE001
+        log_error("Кубики", e)
+        notify(f"Не получилось бросить кубики: {e}", ok=False)
 
 
 def cmd_gamebar(t):
@@ -2812,21 +2842,41 @@ def cmd_music_ui(t):
 
 def cmd_clipboard(t):
     def work():
-        text = js.clipboard_selected_text() if has(t, "выделенн") else js.clipboard_get_text()
-        if not text:
-            notify("В буфере обмена нет текста.", ok=False); return
-        notify(text[:1200], force_speak=True)
+        try:
+            text = js.clipboard_selected_text() if has(t, "выделенн") else js.get_clipboard_text()
+        except js.ActionError as e:
+            log_error("Буфер обмена", e)
+            notify(str(e), ok=False)
+            return
+        for chunk in re.findall(r".{1,300}(?:[.!?]|$)", text, flags=re.S):
+            if chunk.strip():
+                notify(chunk.strip(), force_speak=True)
     _async("Буфер обмена", work)
 
 
 def cmd_translate_clipboard(t):
     def work():
-        text = js.clipboard_get_text()
-        if not text: raise RuntimeError("в буфере обмена нет текста")
+        try:
+            text = js.get_clipboard_text()
+        except js.ActionError as e:
+            log_error("Перевод буфера", e)
+            notify(str(e), ok=False)
+            return
         target = re.sub(r".*?переведи буфер(?:\s+на)?\s*", "", t).strip() or CFG["integrations"]["translation_language"]
-        if not ASSISTANT: raise RuntimeError("нейросеть недоступна")
-        answer = ASSISTANT.ask(f"Переведи на {target}. Верни только перевод:\n{text}")
-        js.clipboard_set_text(answer); notify(answer)
+        if not ASSISTANT:
+            notify("Не получилось перевести: нейросеть недоступна.", ok=False)
+            return
+        try:
+            answer = (ASSISTANT.ask(f"Переведи на {target}. Верни только перевод:\n{text}") or "").strip()
+            if not answer:
+                raise RuntimeError("нейросеть вернула пустой ответ")
+            if not js.clipboard_set_text(answer):
+                raise RuntimeError("не получилось записать перевод в буфер обмена")
+        except Exception as e:  # noqa: BLE001
+            log_error("Перевод буфера", e)
+            notify(f"Не получилось перевести: {e}", ok=False)
+            return
+        notify(answer)
     _async("Перевод буфера", work)
 
 
@@ -2944,7 +2994,8 @@ COMMANDS = [
     Cmd(lambda t: has(t, "доброе утро", "утренний брифинг"), cmd_briefing, False),
     Cmd(lambda t: has(t, "прочитай уведомлен"), cmd_notifications, False),
     Cmd(lambda t: has(t, "переведи буфер"), cmd_translate_clipboard, False),
-    Cmd(lambda t: has(t, "прочитай буфер", "прочитай выделенн"), cmd_clipboard, False),
+    Cmd(lambda t: has(t, "прочитай буфер", "прочитай выделенн", "прочти выделенн",
+                        "озвучь выделенн", "читай выделенн", "что в буфере", "озвучь буфер"), cmd_clipboard, False),
     Cmd(lambda t: has(t, "отправь в телеграм"), lambda t: _send_message("телеграм", t), False),
     Cmd(lambda t: has(t, "отправь в дискорд"), lambda t: _send_message("дискорд", t), False),
     Cmd(lambda t: re.match(r".+\s+(?:тише|громче|громкость\s+на)", t) is not None, cmd_app_volume, False),
@@ -2958,16 +3009,16 @@ COMMANDS = [
     Cmd(lambda t: has(t, "запусти тесты"), cmd_tests, False),
     Cmd(lambda t: has(t, "создай файл возможностей", "создай список возможностей",
                         "создай файл со всеми возможностями", "выгрузи возможности", "что ты умеешь"), cmd_export_capabilities, False),
-    Cmd(lambda t: has(t, "брось") and ("d" in t or has(t, "куб")), cmd_dice, False),
-    Cmd(lambda t: has(t, "подбрось монет"), cmd_dice, False),
+    Cmd(lambda t: has(t, "брос", "кин", "бросок") and ("d" in t or "д" in t or has(t, "куб", "кост")), cmd_dice, False),
+    Cmd(lambda t: has(t, "подбрось монет", "монетк"), cmd_dice, False),
     Cmd(lambda t: has(t, "список дел") or has(t, "добав") and has(t, "список")
                   or has(t, "очисти выполн") or has(t, "отметь выполн"), cmd_todo, False),
     Cmd(lambda t: has(t, "таймер", "будильник", "секундомер", "засеки", "сколько осталось")
                   or has(t, "отмени таймер"), cmd_timer, False),
     Cmd(lambda t: has(t, "переключи звук") and has(t, "наушник", "колонк"), cmd_output, False),
     Cmd(lambda t: has(t, "что сейчас играет", "сейчас играет") or is_word(t, "пауза", "играй")
-                  or has(t, "следующ", "предыдущ") and has(t, "трек"), cmd_media, False),
-    Cmd(lambda t: has(t, "закрой") and not has(t, "браузер", "хром", "стим", "дискорд", "телеграм", "музык"), cmd_close_any, False),
+                  or has(t, "следующ", "дальше", "вперед", "предыдущ", "прошл", "назад", "верни") and has(t, "трек", "песн"), cmd_media, False),
+    Cmd(lambda t: jarvis_routing.close_verb(t) and not has(t, "браузер", "хром", "стим", "дискорд", "телеграм", "музык"), cmd_close_any, False),
     # раньше своих команд: «загугли кс2» должно искать, а не запускать игру
     Cmd(lambda t: bool(SEARCH_RE.search(t)) and not TRACK_RE.search(t), cmd_search, False),
     Cmd(lambda t: _custom_match(t) is not None, cmd_custom, False),  # свои команды — раньше встроенных
@@ -3361,6 +3412,8 @@ def main() -> None:
     ap.add_argument("--list-voices", action="store_true", help="список голосов TTS")
     ap.add_argument("--say", metavar="ТЕКСТ", help="проверить голос: произнести текст")
     ap.add_argument("--ask", metavar="ВОПРОС", help="спросить нейросеть (нужен ключ в настройках)")
+    ap.add_argument("--match", metavar="ФРАЗА", help="показать диагностику маршрутизации команды")
+    ap.add_argument("--clipboard-test", action="store_true", help="проверить чтение текста из буфера обмена")
     args = ap.parse_args()
     if args.check:
         print_check()
@@ -3373,6 +3426,17 @@ def main() -> None:
         return
     if args.ask:
         ask_test(args.ask)
+        return
+    if args.match:
+        print(jarvis_routing.format_diagnosis(args.match, CFG.get("commands")))
+        return
+    if args.clipboard_test:
+        try:
+            text = js.get_clipboard_text()
+        except js.ActionError as e:
+            print(f"[!!] {e}")
+            return
+        print(f"[OK] Текст в буфере: {len(text)} символов")
         return
 
     if not single_instance():

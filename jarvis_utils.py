@@ -266,29 +266,121 @@ MAX_DICE = 100
 MAX_FACES = 1000
 
 
-def roll_dice(expr: str) -> dict:
-    """«d20», «4d6», «d6 плюс 3», «d6+3» -> {total, rolls, mod, detail}.
+def _number_at_start(text: str) -> tuple[int | None, str]:
+    """Число 0–100 в начале строки и его остаток."""
+    text = text.strip()
+    m = re.match(r"(\d{1,3})\b", text)
+    if m:
+        return int(m.group(1)), text[m.end():].strip()
+    words = text.split()
+    if not words:
+        return None, text
+    first = words[0]
+    if len(words) > 1 and first in _TENS and words[1] in _UNITS:
+        return _TENS[first] + _UNITS[words[1]], " ".join(words[2:])
+    if first in _UNITS:
+        return _UNITS[first], " ".join(words[1:])
+    if first in _TENS:
+        return _TENS[first], " ".join(words[1:])
+    return None, text
 
-    Лимиты: до 100 кубиков, до 1000 граней. ValueError — с непонятной формулой.
+
+def _modifier_at_start(text: str) -> int:
+    """«+3», «- 2», «+ три» -> числовой модификатор; иначе 0."""
+    match = re.match(r"\s*([+-])\s*(.*)$", text)
+    if not match:
+        return 0
+    value, _rest = _number_at_start(match.group(2))
+    if value is None:
+        return 0
+    return value if match.group(1) == "+" else -value
+
+
+def parse_dice(text: str) -> dict:
+    """Распознать формулу кубиков из речи/STT без Windows.
+
+    Поддерживаются ``5d20``, ``5д20``, ``пять дэ двадцать``, ``три кубика
+    по шесть``, ``кубик на двадцать``, модификаторы и монетка.
     """
-    t = (expr or "").lower().replace("ё", "е").strip()
-    t = re.sub(r"\s+", "", t)
-    t = t.replace("плюс", "+").replace("минус", "-")
-    m = re.fullmatch(r"(\d*)d(\d+)([+-]\d+)?", t)
-    if not m:
-        raise ValueError(f"не понял формулу «{expr}»: нужно вроде d20, 4d6, d6+3")
-    count = int(m.group(1)) if m.group(1) else 1
-    faces = int(m.group(2))
-    mod = int(m.group(3)) if m.group(3) else 0
+    original = text or ""
+    t = original.lower().replace("ё", "е")
+    if "монет" in t:
+        return {"kind": "coin"}
+    t = re.sub(r"\b(?:брос\w*|кин\w*|бросок\w*|кость\w*|кости\w*)\b", " ", t)
+    t = re.sub(r"\bдэ\b|\bди\b", " d ", t)
+    t = re.sub(r"(?<=\d)\s*[дd]\s*(?=\d)", " d ", t)
+    t = re.sub(r"\bплюс\b", " + ", t)
+    t = re.sub(r"\bминус\b", " - ", t)
+    t = re.sub(r"\s+", " ", t).strip(" ,.!?")
+    compact = re.sub(r"\s+", "", t)
+    match = re.search(r"(\d*)[dд](\d+)([+-]\d+)?", compact)
+    if match:
+        count = int(match.group(1) or 1)
+        faces = int(match.group(2))
+        mod = int(match.group(3) or 0)
+        if not match.group(3):
+            # В compact-форме остаются только цифровые модификаторы. Для
+            # «d6 плюс три» дочитываем словесный хвост исходной фразы.
+            formula = re.search(r"\d*[dд]\s*\d+\s*(.*)$", t)
+            if formula:
+                mod = _modifier_at_start(formula.group(1))
+    else:
+        # STT часто отдаёт «пять дэ двадцать» / «d двадцать» словами.
+        dice_word = re.search(r"\b[dд]\b", t)
+        if dice_word:
+            before, after = t[:dice_word.start()].strip(), t[dice_word.end():].strip()
+            count = 1
+            if before:
+                count, _unused = _number_at_start(before)
+                if count is None:
+                    raise ValueError(f"не понял число кубиков в «{original}»")
+            faces, tail = _number_at_start(after)
+            if faces is None:
+                raise ValueError(f"не понял формулу «{original}»: не указано число граней")
+            mod = _modifier_at_start(tail)
+            if count < 1 or count > MAX_DICE or faces < 2 or faces > MAX_FACES:
+                raise ValueError("слишком много кубиков")
+            return {"kind": "dice", "count": count, "faces": faces, "mod": mod,
+                    "detail": f"{count}d{faces}" + (f"{mod:+d}" if mod else "")}
+        words = t.split()
+        count, rest = _number_at_start(t)
+        rest_words = rest.split()
+        if rest_words and rest_words[0].startswith("куб"):
+            count = count or 1
+            rest = " ".join(rest_words[1:])
+        elif t.startswith("куб"):
+            count, rest = 1, t
+        else:
+            raise ValueError(f"не понял формулу «{original}»: нужно вроде d20, 4d6, d6 плюс 3")
+        rest = re.sub(r"^(?:(?:кубик\w*|куб\w*)\s*)?(?:по|на)\s*", "", rest).strip()
+        faces, tail = _number_at_start(rest)
+        if faces is None:
+            raise ValueError(f"не понял формулу «{original}»: не указано число граней")
+        mod = _modifier_at_start(tail)
+    if count is None:
+        count = 1
     if count < 1 or count > MAX_DICE:
-        raise ValueError(f"кубиков можно от 1 до {MAX_DICE}")
+        raise ValueError("слишком много кубиков")
     if faces < 2 or faces > MAX_FACES:
-        raise ValueError(f"граней можно от 2 до {MAX_FACES}")
+        raise ValueError("слишком много кубиков")
+    return {"kind": "dice", "count": count, "faces": faces, "mod": mod,
+            "detail": f"{count}d{faces}" + (f"{mod:+d}" if mod else "")}
+
+
+def roll_dice(expr: str) -> dict:
+    """Бросить независимые кубики по формуле из :func:`parse_dice`."""
+    parsed = parse_dice(expr)
+    if parsed["kind"] == "coin":
+        return {"coin": flip_coin(), "rolls": [], "total": None, "mod": 0, "detail": "монетка"}
+    count, faces, mod = parsed["count"], parsed["faces"], parsed["mod"]
+    if count < 1 or count > MAX_DICE:
+        raise ValueError("слишком много кубиков")
+    if faces < 2 or faces > MAX_FACES:
+        raise ValueError("слишком много кубиков")
     import random
     rolls = [random.randint(1, faces) for _ in range(count)]
     total = sum(rolls) + mod
-    detail = f"{count}d{faces}" + (f"{mod:+d}" if mod else "")
-    return {"total": total, "rolls": rolls, "mod": mod, "detail": detail}
+    return {"total": total, "rolls": rolls, "mod": mod, "detail": parsed["detail"]}
 
 
 def flip_coin() -> str:

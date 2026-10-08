@@ -128,6 +128,42 @@ def test_roll_dice_4d6_plus3():
     assert sum(r["rolls"]) + 3 == r["total"]
 
 
+def test_parse_dice_speech_variants():
+    cases = {
+        "5д20": (5, 20, 0),
+        "5 д 20": (5, 20, 0),
+        "пять дэ двадцать": (5, 20, 0),
+        "пять ди двадцать": (5, 20, 0),
+        "три кубика по шесть": (3, 6, 0),
+        "кубик на двадцать": (1, 20, 0),
+        "d двадцать": (1, 20, 0),
+        "d6 плюс 3": (1, 6, 3),
+        "d6 плюс три": (1, 6, 3),
+        "2d8 минус 1": (2, 8, -1),
+        "два d восемь минус один": (2, 8, -1),
+    }
+    for phrase, expected in cases.items():
+        parsed = u.parse_dice(phrase)
+        assert (parsed["count"], parsed["faces"], parsed["mod"]) == expected
+
+
+def test_roll_dice_independent_numbers_and_sum(monkeypatch):
+    values = iter([1, 6, 2, 5, 3])
+    monkeypatch.setattr("random.randint", lambda low, high: next(values))
+    result = u.roll_dice("5d6")
+    assert result["rolls"] == [1, 6, 2, 5, 3]
+    assert result["total"] == sum(result["rolls"])
+
+
+def test_parse_dice_limits_and_coin():
+    import pytest
+    assert u.parse_dice("подбрось монетку")["kind"] == "coin"
+    with pytest.raises(ValueError, match="слишком много кубиков"):
+        u.parse_dice("101d6")
+    with pytest.raises(ValueError, match="слишком много кубиков"):
+        u.parse_dice("d1001")
+
+
 def test_roll_dice_limits():
     import pytest
     with pytest.raises(ValueError):
