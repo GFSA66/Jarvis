@@ -308,8 +308,8 @@ def win_notifications_read(limit: int = 10) -> list[dict]:
     Если winsdk недоступен — поднимает IntegrationError.
     """
     try:
-        import winrt.windows.ui.notifications.management as unm
-        import winrt.windows.foundation as wf
+        import winrt.windows.ui.notifications.management as unm  # pyright: ignore[reportMissingImports]
+        import winrt.windows.foundation as wf  # pyright: ignore[reportMissingImports]
     except ImportError as e:
         raise IntegrationError(
             "winsdk/winrt не установлен. Для чтения уведомлений Windows "
