@@ -16,6 +16,9 @@ import re
 import sys
 import threading
 import webbrowser
+import hashlib
+import secrets
+import json
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog
@@ -50,12 +53,14 @@ AI_STYLES = [("film", "Как в кино — учтивый, с характе�
              ("dry", "Сухо — только факты"),
              ("brief", "Кратко — одно-два предложения")]
 
-# --- оформление -------------------------------------------------------------
+# --- оформление (JARVIS HUD) ------------------------------------------------
 FONT = "Segoe UI"
-ACCENT, ACCENT_H = "#1aa6c9", "#1688a6"
+ACCENT, ACCENT_H = "#00d4ff", "#0099bb"
 DANGER, DANGER_H = "#c94a4a", "#a33a3a"
 OK_COLOR, ERR_COLOR, MUTED = "#3ecf8e", "#ff6b6b", "#8b97a6"
-CARD, ROW_A, ROW_B = "#1c232d", "#181e26", "#1e2631"
+CARD, ROW_A, ROW_B = "#111927", "#0d1420", "#16202f"
+CARD_BORDER = "#1e3a4a"
+TITLE_COLOR = "#00d4ff"
 GHOST_H = "#2b3646"
 
 ICON = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "jarvis.ico"
@@ -367,7 +372,8 @@ def _short(text: str, limit: int = 90) -> str:
 #  Главное окно
 # ============================================================================
 
-def open_settings(root, cfg: dict, on_save, autostart=None, ai=None, say=None) -> None:
+def open_settings(root, cfg: dict, on_save, autostart=None, ai=None, say=None,
+                  history_read=None, history_clear=None, history_run=None) -> None:
     """Открыть окно (или поднять уже открытое). Вызывать из Tk-потока."""
     global _instance
     if _instance is not None:
@@ -381,13 +387,16 @@ def open_settings(root, cfg: dict, on_save, autostart=None, ai=None, say=None) -
             pass
     ctk.set_appearance_mode("dark")
     _fix_ru_hotkeys(root)
-    _instance = SettingsWindow(root, cfg, on_save, autostart, ai, say)
+    _instance = SettingsWindow(root, cfg, on_save, autostart, ai, say,
+                               history_read, history_clear, history_run)
 
 
 class SettingsWindow:
-    def __init__(self, root, cfg: dict, on_save, autostart=None, ai=None, say=None):
+    def __init__(self, root, cfg: dict, on_save, autostart=None, ai=None, say=None,
+                 history_read=None, history_clear=None, history_run=None):
         self.cfg, self.on_save, self.autostart = cfg, on_save, autostart
         self.ai, self.say = ai, say
+        self.history_read, self.history_clear, self.history_run = history_read, history_clear, history_run
         w = self.win = ctk.CTkToplevel(root)
         w.title("Джарвис — настройки")
         w.geometry("940x700")
@@ -407,7 +416,8 @@ class SettingsWindow:
         tabs._segmented_button.configure(font=_font(13, True))
         tabs.pack(fill="both", expand=True, padx=16, pady=(0, 4))
 
-        names = ["Мои команды", "Игры Steam", "Сайты", "Ссылки", "Общие"]
+        names = ["Мои команды", "Игры Steam", "Сайты", "Ссылки", "Общие",
+                 "Безопасность", "Уведомления", "Интеграции", "Диктовка", "История"]
         if ai is not None:
             names.append("Нейросеть")
         t = {name: tabs.add(name) for name in names + ["Пути"]}
@@ -435,6 +445,11 @@ class SettingsWindow:
 
         self._build_links(t["Ссылки"])
         self._build_general(t["Общие"])
+        self._build_security(t["Безопасность"])
+        self._build_notifications(t["Уведомления"])
+        self._build_integrations(t["Интеграции"])
+        self._build_dictation(t["Диктовка"])
+        self._build_history(t["История"])
         if ai is not None:
             self._build_ai(t["Нейросеть"])
         self._build_paths(t["Пути"])
@@ -457,22 +472,32 @@ class SettingsWindow:
 
     # --- вкладки ---------------------------------------------------------
     @staticmethod
+    @staticmethod
     def _card(parent, title: str, row: int) -> ctk.CTkFrame:
-        card = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=12)
-        card.grid(row=row, column=0, sticky="ew", padx=4, pady=(0, 10))
-        card.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(card, text=title, font=_font(14, True), text_color=ACCENT).grid(
-            row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(12, 6))
+        card = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=14,
+                            border_width=1, border_color=CARD_BORDER)
+        card.grid(row=row, column=0, sticky="ew", padx=6, pady=(0, 12))
+        # 0 — подпись фиксированной ширины, 1 — поле, 2 — подсказка тянется
+        card.grid_columnconfigure(0, minsize=250)
+        card.grid_columnconfigure(1, weight=0)
+        card.grid_columnconfigure(2, weight=1)
+        ctk.CTkLabel(card, text=title, font=_font(14, True), text_color=TITLE_COLOR).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=18, pady=(14, 8))
         return card
 
     @staticmethod
     def _field(card, r: int, label: str, entry, note: str = "") -> None:
         ctk.CTkLabel(card, text=label, font=_font(), anchor="w").grid(
-            row=r, column=0, sticky="w", padx=(16, 12), pady=5)
-        entry.grid(row=r, column=1, sticky="ew", padx=(0, 16), pady=5)
+            row=r, column=0, sticky="w", padx=(18, 12), pady=6)
+        try:
+            entry.grid_configure(sticky="w")
+        except Exception:
+            pass
+        entry.grid(row=r, column=1, sticky="w", padx=(0, 12), pady=6)
         if note:
-            ctk.CTkLabel(card, text=note, font=_font(11), text_color=MUTED).grid(
-                row=r, column=2, sticky="w", padx=(0, 16))
+            ctk.CTkLabel(card, text=note, font=_font(11), text_color=MUTED,
+                         anchor="w", justify="left", wraplength=320).grid(
+                row=r, column=2, sticky="w", padx=(0, 18), pady=6)
 
     def _build_links(self, tab) -> None:
         tab.grid_columnconfigure(0, weight=1)
@@ -543,7 +568,7 @@ class SettingsWindow:
         ctk.CTkFrame(card, fg_color="transparent", height=10).grid(row=4, column=0)
 
         # --- слово-активатор
-        card = self._card(sf, "Слово-активатор", 1)
+        card = self._card(sf, "Слово-активатор", 2)
         self.sw_wake = ctk.CTkSwitch(card, text="Реагировать только на фразы со словом-активатором",
                                      font=_font(), progress_color=ACCENT)
         self.sw_wake.grid(row=1, column=0, columnspan=3, sticky="w", padx=16, pady=5)
@@ -555,7 +580,7 @@ class SettingsWindow:
         ctk.CTkFrame(card, fg_color="transparent", height=10).grid(row=3, column=0)
 
         # --- Chrome
-        card = self._card(sf, "Chrome", 2)
+        card = self._card(sf, "Chrome", 3)
         self.v_prof_main = _entry(card, c["chrome"]["main_profile"] or "Default", width=200)
         self.v_prof_study = _entry(card, c["chrome"]["study_profile"] or "", width=200, placeholder="как основной")
         self._field(card, 1, "Профиль основной", self.v_prof_main, "папка профиля: Default, Profile 1…")
@@ -565,7 +590,7 @@ class SettingsWindow:
         ctk.CTkFrame(card, fg_color="transparent", height=10).grid(row=3, column=0)
 
         # --- планировщик
-        card = self._card(sf, "Планировщик заданий Windows", 3)
+        card = self._card(sf, "Планировщик заданий Windows", 4)
         self.v_task = _entry(card, c["genshin_task"] or "", width=240, placeholder="имя задачи")
         self._field(card, 1, "Задача для запуска Genshin", self.v_task, "schtasks /run — если игре нужны права админа")
         self.v_task.grid_configure(sticky="w")
@@ -594,7 +619,7 @@ class SettingsWindow:
             ctk.CTkFrame(card, fg_color="transparent", height=6).grid(row=r, column=0)
 
         # --- фразы
-        card = self._card(sf, "Фразы управления", 4)
+        card = self._card(sf, "Фразы управления", 5)
         self.v_phr = {}
         for i, (key, label) in enumerate(PHRASE_LABELS, start=1):
             self.v_phr[key] = _entry(card, c["phrases"][key], width=320)
@@ -675,14 +700,21 @@ class SettingsWindow:
         if a.get("self_edit", True):
             self.sw_ai_self.select()
 
+        self.sw_ai_refine = ctk.CTkSwitch(
+            card, text="Додумывать непонятые фразы: исправлять слова и расставлять запятые",
+            font=_font(), progress_color=ACCENT)
+        self.sw_ai_refine.grid(row=13, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 5))
+        if a.get("refine", True):
+            self.sw_ai_refine.select()
+
         self.sw_hist = ctk.CTkSwitch(card, text="История запросов (файл history.jsonl, команда «история запросов»)",
                                      font=_font(), progress_color=ACCENT)
-        self.sw_hist.grid(row=13, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 5))
+        self.sw_hist.grid(row=14, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 5))
         if self.cfg.get("history", {}).get("enabled", True):
             self.sw_hist.select()
 
         bar = ctk.CTkFrame(card, fg_color="transparent")
-        bar.grid(row=14, column=0, columnspan=3, sticky="ew", padx=16, pady=(8, 14))
+        bar.grid(row=15, column=0, columnspan=3, sticky="ew", padx=16, pady=(8, 14))
         self.btn_ai_test = _button(bar, "Проверить", self._ai_test, width=110)
         self.btn_ai_test.pack(side="left")
         self.lbl_ai_test = ctk.CTkLabel(bar, text="", font=_font(12), anchor="w", justify="left", wraplength=560)
@@ -735,6 +767,7 @@ class SettingsWindow:
             "pc_context": bool(self.sw_ai_pc.get()),
             "files": bool(self.sw_ai_files.get()),
             "self_edit": bool(self.sw_ai_self.get()),
+            "refine": bool(self.sw_ai_refine.get()),
         }
 
     def _ai_test(self) -> None:
@@ -774,6 +807,122 @@ class SettingsWindow:
             _button(card, "Обзор…", lambda e=e: self._browse(e), width=90).grid(
                 row=i, column=2, padx=(0, 16))
         ctk.CTkFrame(card, fg_color="transparent", height=8).grid(row=len(PATH_LABELS) + 1, column=0)
+
+    def _build_security(self, tab) -> None:
+        tab.grid_columnconfigure(0, weight=1)
+        sec = self.cfg.get("security", {})
+        card = self._card(tab, "Подтверждения и парольная фраза", 0)
+        self.sw_confirm = ctk.CTkSwitch(card, text="Запрашивать подтверждение опасных действий", font=_font())
+        if sec.get("confirm_dangerous", True): self.sw_confirm.select()
+        self._field(card, 1, "Подтверждения", self.sw_confirm,
+                    "Выключение, сон, удаление, сообщения и жёсткое закрытие процессов.")
+        self.v_password = _entry(card, "", width=300, placeholder="Оставь пустым, чтобы не менять")
+        self.v_password.configure(show="•")
+        self._field(card, 2, "Новая парольная фраза", self.v_password,
+                    "Хранится только salted SHA-256 хеш. Это защита от случайных срабатываний, не биометрия.")
+
+    def _build_notifications(self, tab) -> None:
+        tab.grid_columnconfigure(0, weight=1)
+        n = self.cfg.get("notifications", {})
+        card = self._card(tab, "Всплывающие уведомления", 0)
+        self.v_notif_pos = ctk.StringVar(value=str(n.get("position", "bottom_right")))
+        self.v_notif_theme = ctk.StringVar(value=str(n.get("theme", "dark")))
+        self.v_notif_duration = _entry(card, str(n.get("duration_ms", 5000)), width=130)
+        self.v_notif_font = _entry(card, str(n.get("font_size", 14)), width=130)
+        pos = ctk.CTkOptionMenu(card, variable=self.v_notif_pos, values=["bottom_right", "bottom_left", "top_right", "top_left"], width=200)
+        theme = ctk.CTkOptionMenu(card, variable=self.v_notif_theme, values=["dark", "light", "minimal"], width=200)
+        self._field(card, 1, "Позиция", pos)
+        self._field(card, 2, "Тема", theme)
+        self._field(card, 3, "Длительность, мс", self.v_notif_duration)
+        self._field(card, 4, "Размер шрифта", self.v_notif_font)
+
+    def _build_integrations(self, tab) -> None:
+        tab.grid_columnconfigure(0, weight=1)
+        ic = self.cfg.get("integrations", {})
+        card = self._card(tab, "Интеграции и разработка", 0)
+        self.v_city = _entry(card, str(ic.get("weather_city", "")), width=260, placeholder="Город")
+        self.v_lat = _entry(card, str(ic.get("latitude", "")), width=130, placeholder="широта")
+        self.v_lon = _entry(card, str(ic.get("longitude", "")), width=130, placeholder="долгота")
+        self.v_hotkey = _entry(card, str(ic.get("hotkey", "ctrl+alt+j")), width=180)
+        self.v_test_project = _entry(card, str(ic.get("test_project", "")), width=300, placeholder="путь к проекту")
+        self.v_test_command = _entry(card, str(ic.get("test_command", "pytest")), width=220)
+        self.v_telegram_token = _entry(card, str(ic.get("telegram_token", "")), width=300, placeholder="токен Telegram-бота")
+        self.v_telegram_token.configure(show="•")
+        self.v_discord_hooks = _entry(card, json.dumps(ic.get("discord_webhooks", {}), ensure_ascii=False), width=300, placeholder='{"канал": "webhook"}')
+        self._field(card, 1, "Город", self.v_city)
+        self._field(card, 2, "Координаты", self.v_lat, "Укажи широту; долготу задай в поле справа")
+        self.v_lon.grid(row=2, column=2, sticky="w", padx=(0, 18), pady=6)
+        self._field(card, 3, "Горячая клавиша", self.v_hotkey, "Например: ctrl+alt+j.")
+        self._field(card, 4, "Проект для тестов", self.v_test_project)
+        self._field(card, 5, "Команда тестов", self.v_test_command)
+        self._field(card, 6, "Токен Telegram", self.v_telegram_token, "Секрет маскируется. При отсутствии keyring хранится в config.json.")
+        self._field(card, 7, "Discord webhooks JSON", self.v_discord_hooks)
+
+    def _build_dictation(self, tab) -> None:
+        tab.grid_columnconfigure(0, weight=1)
+        dc = self.cfg.get("dictation", {})
+        card = self._card(tab, "Ввод текста в активное окно", 0)
+        self.v_dict_method = ctk.StringVar(value=str(dc.get("method", "auto")))
+        self.v_dict_delay = _entry(card, str(dc.get("char_delay_ms", 8)), width=120)
+        self.v_dict_timeout = _entry(card, str(dc.get("idle_timeout_sec", 120)), width=120)
+        self.v_dict_blacklist = _entry(card, ", ".join(dc.get("blacklist", [])), width=340)
+        self.sw_dict_format = ctk.CTkSwitch(card, text="Автоформатирование знаков и регистра", font=_font())
+        self.sw_dict_confirm = ctk.CTkSwitch(card, text="Подтверждать ввод в неизвестное окно", font=_font())
+        self.sw_dict_indicator = ctk.CTkSwitch(card, text="Показывать индикатор режима диктовки", font=_font())
+        if dc.get("autoformat", True): self.sw_dict_format.select()
+        if dc.get("confirm_unknown", False): self.sw_dict_confirm.select()
+        if dc.get("indicator", True): self.sw_dict_indicator.select()
+        method = ctk.CTkOptionMenu(card, variable=self.v_dict_method, values=["auto", "unicode", "clipboard"], width=180)
+        self._field(card, 1, "Способ ввода", method, "Авто: Unicode SendInput, а для терминалов и длинного текста — буфер.")
+        self._field(card, 2, "Задержка символов, мс", self.v_dict_delay)
+        self._field(card, 3, "Выход по тишине, с", self.v_dict_timeout)
+        self._field(card, 4, "Чёрный список окон", self.v_dict_blacklist)
+        self._field(card, 5, "Правила текста", self.sw_dict_format)
+        self._field(card, 6, "Неизвестное окно", self.sw_dict_confirm)
+        self._field(card, 7, "Индикатор", self.sw_dict_indicator)
+
+    def _build_history(self, tab) -> None:
+        tab.grid_columnconfigure(0, weight=1)
+        card = self._card(tab, "История распознанных запросов", 0)
+        self.v_history_search = _entry(card, "", width=280, placeholder="поиск по тексту")
+        self._field(card, 1, "Поиск", self.v_history_search)
+        _button(card, "Найти", self._refresh_history, width=90).grid(row=1, column=2, sticky="w", padx=(0, 16))
+        self.history_box = ctk.CTkTextbox(card, width=700, height=280, font=_font(12), wrap="word")
+        self.history_box.grid(row=2, column=0, columnspan=3, sticky="ew", padx=18, pady=(10, 8))
+        self.v_history_run = _entry(card, "", width=420, placeholder="фраза для повторного выполнения")
+        self._field(card, 3, "Повторить", self.v_history_run)
+        _button(card, "Выполнить снова", self._history_run, "accent", 150).grid(row=3, column=2, sticky="w", padx=(0, 16))
+        _button(card, "Очистить историю", self._history_clear, "danger", 150).grid(row=4, column=1, sticky="w", padx=(0, 12), pady=(8, 14))
+        self._refresh_history()
+
+    def _refresh_history(self) -> None:
+        if not hasattr(self, "history_box"):
+            return
+        query = self.v_history_search.get().strip() if hasattr(self, "v_history_search") else ""
+        rows = self.history_read(query) if self.history_read else []
+        self.history_box.delete("1.0", "end")
+        if not rows:
+            self.history_box.insert("end", "История пуста.")
+            return
+        for r in rows[:100]:
+            text = str(r.get("question") or r.get("text") or "")
+            self.history_box.insert("end", f"{r.get('time', '')}  [{r.get('type', '')}]\n{text}\n→ {r.get('answer', '')}\n\n")
+        first = str(rows[0].get("question") or "")
+        if first:
+            self.v_history_run.delete(0, "end")
+            self.v_history_run.insert(0, first)
+
+    def _history_run(self) -> None:
+        text = self.v_history_run.get().strip()
+        if not text or not self.history_run:
+            return
+        self.history_run(text)
+        self._set_status("Команда отправлена на выполнение ✓", OK_COLOR)
+
+    def _history_clear(self) -> None:
+        if not self.history_clear:
+            return
+        ask(self.win, "Очистить историю", "Удалить всю историю запросов?", on_yes=lambda: (self.history_clear(), self._refresh_history()), danger=True)
 
     def _browse(self, entry) -> None:
         p = filedialog.askopenfilename(parent=self.win, title="Выбери файл")
@@ -876,12 +1025,57 @@ class SettingsWindow:
             "genshin_task": self.v_task.get().strip() or None,
             "phrases": phrases,
             "paths": {k: v.get().strip() for k, v in self.v_paths.items() if v.get().strip()},
+            "security": {"confirm_dangerous": bool(self.sw_confirm.get())},
+            "notifications": {"position": self.v_notif_pos.get(), "theme": self.v_notif_theme.get(),
+                              "duration_ms": self._int_field(self.v_notif_duration, "Длительность", 500, 30000),
+                              "font_size": self._int_field(self.v_notif_font, "Размер шрифта", 9, 28)},
+            "integrations": self._integration_form(),
+            "dictation": {"method": self.v_dict_method.get(),
+                          "char_delay_ms": self._int_field(self.v_dict_delay, "Задержка символов", 1, 100),
+                          "idle_timeout_sec": self._int_field(self.v_dict_timeout, "Таймаут диктовки", 10, 3600),
+                          "blacklist": [x.strip().lower() for x in self.v_dict_blacklist.get().split(",") if x.strip()],
+                          "autoformat": bool(self.sw_dict_format.get()),
+                          "confirm_unknown": bool(self.sw_dict_confirm.get()),
+                          "indicator": bool(self.sw_dict_indicator.get())},
         }
+        phrase = self.v_password.get().strip()
+        if phrase:
+            salt = secrets.token_hex(16)
+            patch["security"].update({"password_salt": salt,
+                "password_hash": hashlib.sha256((salt + phrase.lower()).encode("utf-8")).hexdigest()})
         sw_hist = getattr(self, "sw_hist", None)  # вкладка «Нейросеть» есть не всегда
         if sw_hist is not None:
             hist = self.cfg.get("history", {})
             patch["history"] = {"enabled": bool(sw_hist.get()), "max": int(hist.get("max") or 300)}
         return patch
+
+    @staticmethod
+    def _int_field(entry, label: str, low: int, high: int) -> int:
+        try:
+            n = int(entry.get().strip())
+        except ValueError:
+            raise ValueError(f"{label} — целое число от {low} до {high}.") from None
+        if not low <= n <= high:
+            raise ValueError(f"{label} — целое число от {low} до {high}.")
+        return n
+
+    def _integration_form(self) -> dict:
+        try:
+            hooks = json.loads(self.v_discord_hooks.get().strip() or "{}")
+            if not isinstance(hooks, dict):
+                raise ValueError
+        except ValueError:
+            raise ValueError("Discord webhooks — JSON-объект вида {\"канал\": \"webhook\"}.") from None
+        old = self.cfg.get("integrations", {})
+        return {"weather_city": self.v_city.get().strip(), "latitude": self.v_lat.get().strip(),
+                "longitude": self.v_lon.get().strip(), "hotkey": self.v_hotkey.get().strip() or "ctrl+alt+j",
+                "test_project": self.v_test_project.get().strip(),
+                "test_command": self.v_test_command.get().strip() or "pytest",
+                "telegram_token": self.v_telegram_token.get().strip() or old.get("telegram_token", ""),
+                "discord_webhooks": hooks, "translation_language": old.get("translation_language", "английский"),
+                "telegram_contacts": old.get("telegram_contacts", {}),
+                "daily_reminders": old.get("daily_reminders", []),
+                "test_timeout_sec": old.get("test_timeout_sec", 300)}
 
     def save(self) -> None:
         try:

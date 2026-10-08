@@ -1,0 +1,41 @@
+{
+  "wake_word": {"enabled": false, "word": "джарвис"},
+  "security": {
+    "confirm_dangerous": true,
+    "password_salt": "",
+    "password_hash": ""
+  },
+  "notifications": {
+    "position": "bottom_right",
+    "duration_ms": 5000,
+    "font_size": 14,
+    "theme": "dark"
+  },
+  "dictation": {
+    "method": "auto",
+    "char_delay_ms": 8,
+    "autoformat": true,
+    "idle_timeout_sec": 120,
+    "blacklist": ["пароль", "password", "1password", "bitwarden", "keepass"],
+    "confirm_unknown": false,
+    "indicator": true
+  },
+  "system": {
+    "app_aliases": {"хром": "chrome.exe", "блокнот": "notepad.exe"},
+    "sound_devices": {"наушники": "Headphones", "колонки": "Speakers"}
+  },
+  "integrations": {
+    "weather_city": "",
+    "latitude": "",
+    "longitude": "",
+    "translation_language": "английский",
+    "telegram_token": "",
+    "telegram_contacts": {"мама": "123456789"},
+    "discord_webhooks": {"общий": "https://discord.com/api/webhooks/..."},
+    "test_project": "",
+    "test_command": "pytest",
+    "test_timeout_sec": 300,
+    "hotkey": "ctrl+alt+j",
+    "daily_reminders": []
+  }
+}
