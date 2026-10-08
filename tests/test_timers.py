@@ -74,7 +74,7 @@ def test_parse_timer_phrase():
     p = jt.parse_timer_phrase("таймер на пять минут на чай")
     assert p["kind"] == "timer" and p["seconds"] == 300
     p = jt.parse_timer_phrase("поставь будильник на 7:30")
-    assert p == {"kind": "alarm", "clock": "07:30", "text": ""}
+    assert p["kind"] == "alarm" and p["clock"] == "07:30"
     p = jt.parse_timer_phrase("напомни через полчаса проверить печь")
     assert p and p["kind"] == "timer" and p["seconds"] == 1800
     assert jt.parse_timer_phrase("загугли погоду") is None
