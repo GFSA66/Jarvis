@@ -1400,6 +1400,24 @@ def commands_text() -> str:
 {chr(10).join("— " + c["phrase"] + " → " + c["target"] for c in CFG["commands"]) or "— пока нет (добавь в настройках)"}"""
 
 
+def cmd_export_capabilities(t):
+    """Создать в корне проекта/рядом с exe Markdown со всеми голосовыми возможностями."""
+    path = APP_DIR / "JARVIS_CAPABILITIES.md"
+    content = (
+        "# Возможности Джарвиса\n\n"
+        f"Сформировано: {datetime.now():%Y-%m-%d %H:%M:%S}\n\n"
+        "Ниже — актуальный список команд, сформированный текущей конфигурацией.\n\n"
+        "```text\n" + commands_text() + "\n```\n"
+    )
+    try:
+        path.write_text(content, encoding="utf-8")
+        os.startfile(str(path))
+        notify(f"Создал и открыл файл возможностей: {path}")
+    except OSError as e:
+        log_error("Экспорт возможностей", e)
+        notify(f"Не получилось создать файл возможностей: {e}", ok=False)
+
+
 def hard_exit(delay: float = 12.0) -> None:
     """Страховка: если что-то (микрофон, озвучка, окно) зависло при выходе — убиваем процесс."""
     timer = threading.Timer(delay, lambda: os._exit(0))
@@ -2905,6 +2923,8 @@ COMMANDS = [
     Cmd(lambda t: has(t, "сделай скриншот", "снимок экрана"), cmd_screenshot, False),
     Cmd(lambda t: has(t, "запиши последние тридцать секунд", "запиши последние 30 секунд"), cmd_gamebar, True),
     Cmd(lambda t: has(t, "запусти тесты"), cmd_tests, False),
+    Cmd(lambda t: has(t, "создай файл возможностей", "создай список возможностей",
+                        "создай файл со всеми возможностями", "выгрузи возможности"), cmd_export_capabilities, False),
     Cmd(lambda t: has(t, "брось") and ("d" in t or has(t, "куб")), cmd_dice, False),
     Cmd(lambda t: has(t, "подбрось монет"), cmd_dice, False),
     Cmd(lambda t: has(t, "список дел") or has(t, "добав") and has(t, "список")
