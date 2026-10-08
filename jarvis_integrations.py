@@ -308,8 +308,8 @@ def win_notifications_read(limit: int = 10) -> list[dict]:
     Если winsdk недоступен — поднимает IntegrationError.
     """
     try:
-        import winrt.windows.ui.notifications.management as unm  # pyright: ignore[reportMissingImports]
-        import winrt.windows.foundation as wf  # pyright: ignore[reportMissingImports]
+        import winrt.windows.ui.notifications.management as unm
+        import winrt.windows.foundation as wf
     except ImportError as e:
         raise IntegrationError(
             "winsdk/winrt не установлен. Для чтения уведомлений Windows "
@@ -362,7 +362,7 @@ def ai_translate(text: str, target_lang: str, api_key: str, model: str = "gpt-4o
 
 def keyring_get(service: str, key: str) -> str | None:
     try:
-        import keyring  # pyright: ignore[reportMissingImports]
+        import keyring
         return keyring.get_password(service, key)
     except Exception:
         return None
@@ -370,7 +370,7 @@ def keyring_get(service: str, key: str) -> str | None:
 
 def keyring_set(service: str, key: str, value: str) -> bool:
     try:
-        import keyring  # pyright: ignore[reportMissingImports]
+        import keyring
         keyring.set_password(service, key, value)
         return True
     except Exception:
@@ -379,7 +379,7 @@ def keyring_set(service: str, key: str, value: str) -> bool:
 
 def keyring_delete(service: str, key: str) -> bool:
     try:
-        import keyring  # pyright: ignore[reportMissingImports]
+        import keyring
         keyring.delete_password(service, key)
         return True
     except Exception:
