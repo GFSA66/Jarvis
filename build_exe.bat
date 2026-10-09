@@ -31,6 +31,8 @@ if not exist "jarvis.ico" echo [Jarvis] jarvis.ico not found - building with the
     --collect-all customtkinter ^
     --collect-all speech_recognition ^
     --collect-all piper ^
+    --collect-all vosk ^
+    --collect-all faster_whisper ^
     --collect-data ytmusicapi ^
     --collect-data jarvis_settings ^
     --collect-data jarvis_utils ^
@@ -53,11 +55,19 @@ if not exist "jarvis.ico" echo [Jarvis] jarvis.ico not found - building with the
     --hidden-import jarvis_system ^
     --hidden-import jarvis_timers ^
     --hidden-import jarvis_integrations ^
-    jarvis.py jarvis_voice_piper.py jarvis_dictation.py || goto :fail
+    --hidden-import jarvis_stt ^
+    --hidden-import jarvis_intents ^
+    --hidden-import jarvis_routing ^
+    --hidden-import jarvis_history ^
+    --hidden-import jarvis_voice_piper ^
+    --hidden-import jarvis_dictation ^
+    jarvis.py jarvis_voice_piper.py jarvis_dictation.py jarvis_stt.py jarvis_intents.py jarvis_routing.py jarvis_history.py || goto :fail
 
 echo.
 echo [Jarvis] Done: dist\Jarvis.exe
 rem Sources next to the exe: Jarvis can edit his own code in dist\src (rebuild after changes).
+rem STT models are NOT bundled into the exe: vosk/whisper models download on first
+rem run into %USERPROFILE%\.jarvis\models and stay outside the build (keeps exe small).
 if not exist "dist\src" mkdir "dist\src"
 copy /y "jarvis.py" "dist\src\" >nul
 copy /y "jarvis_ai.py" "dist\src\" >nul
@@ -66,6 +76,10 @@ copy /y "jarvis_utils.py" "dist\src\" >nul
 copy /y "jarvis_system.py" "dist\src\" >nul
 copy /y "jarvis_timers.py" "dist\src\" >nul
 copy /y "jarvis_integrations.py" "dist\src\" >nul
+copy /y "jarvis_stt.py" "dist\src\" >nul
+copy /y "jarvis_intents.py" "dist\src\" >nul
+copy /y "jarvis_routing.py" "dist\src\" >nul
+copy /y "jarvis_history.py" "dist\src\" >nul
 copy /y "config.example.json" "dist\src\" >nul
 copy /y "requirements.txt" "dist\src\" >nul
 copy /y "build_exe.bat" "dist\src\" >nul

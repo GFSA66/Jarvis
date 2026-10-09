@@ -53,6 +53,22 @@ AI_STYLES = [("film", "Как в кино — учтивый, с характе�
              ("dry", "Сухо — только факты"),
              ("brief", "Кратко — одно-два предложения")]
 
+# Движки распознавания (config.json → stt.engine) и модели Vosk/Whisper
+STT_ENGINES = [
+    ("vosk", "Vosk — офлайн, быстро и точно на командах (по умолчанию)"),
+    ("hybrid", "Гибрид — офлайн Vosk, при сомнении диктовка/онлайн"),
+    ("whisper", "Whisper — офлайн, лучше для длинных фраз (медленнее)"),
+    ("google", "Google — онлайн, запасной вариант"),
+]
+STT_VOSK_MODELS = [
+    ("small", "small — быстрая (~45 МБ)"),
+    ("large", "large — точнее (~1.8 ГБ)"),
+]
+STT_WHISPER_MODELS = [
+    ("small", "small — быстрая (~460 МБ)"),
+    ("medium", "medium — точнее (~1.5 ГБ)"),
+]
+
 # --- оформление (JARVIS HUD) ------------------------------------------------
 FONT = "Segoe UI"
 WINDOW_BG, HEADER_BG = "#07111f", "#0b1d30"
@@ -374,7 +390,8 @@ def _short(text: str, limit: int = 90) -> str:
 # ============================================================================
 
 def open_settings(root, cfg: dict, on_save, autostart=None, ai=None, say=None,
-                  history_read=None, history_clear=None, history_run=None) -> None:
+                  history_read=None, history_clear=None, history_run=None,
+                  mic_test=None) -> None:
     """Открыть окно (или поднять уже открытое). Вызывать из Tk-потока."""
     global _instance
     if _instance is not None:
@@ -389,14 +406,15 @@ def open_settings(root, cfg: dict, on_save, autostart=None, ai=None, say=None,
     ctk.set_appearance_mode("dark")
     _fix_ru_hotkeys(root)
     _instance = SettingsWindow(root, cfg, on_save, autostart, ai, say,
-                               history_read, history_clear, history_run)
+                               history_read, history_clear, history_run, mic_test)
 
 
 class SettingsWindow:
     def __init__(self, root, cfg: dict, on_save, autostart=None, ai=None, say=None,
-                 history_read=None, history_clear=None, history_run=None):
+                 history_read=None, history_clear=None, history_run=None, mic_test=None):
         self.cfg, self.on_save, self.autostart = cfg, on_save, autostart
         self.ai, self.say = ai, say
+        self.mic_test = mic_test
         self.history_read, self.history_clear, self.history_run = history_read, history_clear, history_run
         w = self.win = ctk.CTkToplevel(root)
         w.title("Джарвис — настройки")
@@ -431,7 +449,8 @@ class SettingsWindow:
         tabs.pack(fill="both", expand=True, padx=18, pady=(0, 8))
 
         names = ["Мои команды", "Игры Steam", "Сайты", "Ссылки", "Общие",
-                 "Безопасность", "Уведомления", "Интеграции", "Диктовка", "История"]
+                 "Безопасность", "Уведомления", "Интеграции", "Диктовка", "Распознавание",
+                 "История"]
         if ai is not None:
             names.append("Нейросеть")
         t = {name: tabs.add(name) for name in names + ["Пути"]}
@@ -463,6 +482,7 @@ class SettingsWindow:
         self._build_notifications(t["Уведомления"])
         self._build_integrations(t["Интеграции"])
         self._build_dictation(t["Диктовка"])
+        self._build_stt(t["Распознавание"])
         self._build_history(t["История"])
         if ai is not None:
             self._build_ai(t["Нейросеть"])
@@ -940,6 +960,110 @@ class SettingsWindow:
             return
         ask(self.win, "Очистить историю", "Удалить всю историю запросов?", on_yes=lambda: (self.history_clear(), self._refresh_history()), danger=True)
 
+    def _build_stt(self, tab) -> None:
+        tab.grid_columnconfigure(0, weight=1)
+        sf = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        sf.pack(fill="both", expand=True)
+        sf.grid_columnconfigure(0, weight=1)
+        s = self.cfg.get("stt", {})
+        card = self._card(sf, "Распознавание речи", 0)
+        self._stt_labels = dict(STT_ENGINES)
+        self._stt_by_label = {v: k for k, v in STT_ENGINES}
+        self._stt_vosk_labels = dict(STT_VOSK_MODELS)
+        self._stt_vosk_by_label = {v: k for k, v in STT_VOSK_MODELS}
+        self._stt_whisper_labels = dict(STT_WHISPER_MODELS)
+        self._stt_whisper_by_label = {v: k for k, v in STT_WHISPER_MODELS}
+
+        self.om_stt_engine = ctk.CTkOptionMenu(
+            card, values=[v for _, v in STT_ENGINES], width=420,
+            height=32, font=_font(), dropdown_font=_font(), fg_color=GHOST_H, button_color=ACCENT,
+            button_hover_color=ACCENT_H)
+        cur_engine = str(s.get("engine") or "vosk")
+        self.om_stt_engine.set(self._stt_labels.get(cur_engine, STT_ENGINES[0][1]))
+        self._field(card, 1, "Движок", self.om_stt_engine,
+                    "Офлайн (Vosk/Whisper) работает без интернета. Модель качается при первом запуске.")
+        self.om_stt_engine.grid_configure(sticky="w")
+
+        self.om_stt_vosk = ctk.CTkOptionMenu(
+            card, values=[v for _, v in STT_VOSK_MODELS], width=420,
+            height=32, font=_font(), dropdown_font=_font(), fg_color=GHOST_H, button_color=ACCENT,
+            button_hover_color=ACCENT_H)
+        self.om_stt_vosk.set(self._stt_vosk_labels.get(str(s.get("model") or "small"), STT_VOSK_MODELS[0][1]))
+        self._field(card, 2, "Модель Vosk", self.om_stt_vosk,
+                    "«large» точнее на длинных фразах, но весит ~1.8 ГБ.")
+        self.om_stt_vosk.grid_configure(sticky="w")
+
+        self.om_stt_whisper = ctk.CTkOptionMenu(
+            card, values=[v for _, v in STT_WHISPER_MODELS], width=420,
+            height=32, font=_font(), dropdown_font=_font(), fg_color=GHOST_H, button_color=ACCENT,
+            button_hover_color=ACCENT_H)
+        self.om_stt_whisper.set(self._stt_whisper_labels.get(str(s.get("whisper_model") or "small"), STT_WHISPER_MODELS[0][1]))
+        self._field(card, 3, "Модель Whisper", self.om_stt_whisper,
+                    "Используется в движках «whisper» и «гибрид» для диктовки.")
+        self.om_stt_whisper.grid_configure(sticky="w")
+
+        self.v_stt_conf = _entry(card, str(s.get("confidence_min", 0.35)), width=120)
+        self._field(card, 4, "Порог уверенности", self.v_stt_conf,
+                    "0–1. Ниже порога фраза молча отбрасывается (защита от мусора).")
+
+        info = self._card(sf, "Проверка микрофона", 1)
+        self.btn_mic = _button(info, "Проверить микрофон", self._stt_test, "accent", 180)
+        self.btn_mic.grid(row=1, column=0, sticky="w", padx=18, pady=(6, 8))
+        self.lbl_mic = ctk.CTkLabel(info, text="", font=_font(12), text_color=MUTED,
+                                    anchor="w", justify="left", wraplength=520)
+        self.lbl_mic.grid(row=1, column=1, sticky="w", padx=(4, 16), pady=6)
+
+    def _stt_form(self) -> dict:
+        conf_raw = self.v_stt_conf.get().strip() or "0.35"
+        try:
+            conf = float(conf_raw)
+            if not 0.0 <= conf <= 1.0:
+                raise ValueError
+        except ValueError:
+            raise ValueError("Порог уверенности — число от 0 до 1 (например 0.35).") from None
+        old = self.cfg.get("stt", {})
+        return {
+            "engine": self._stt_by_label.get(self.om_stt_engine.get(), "vosk"),
+            "model": self._stt_vosk_by_label.get(self.om_stt_vosk.get(), "small"),
+            "whisper_model": self._stt_whisper_by_label.get(self.om_stt_whisper.get(), "small"),
+            "confidence_min": conf,
+            "models_dir": old.get("models_dir", ""),
+            "prebuffer_ms": old.get("prebuffer_ms", 400),
+            "vad_energy_margin": old.get("vad_energy_margin", 2.0),
+            "echo_tail_ms": old.get("echo_tail_ms", 400),
+        }
+
+    def _stt_test(self) -> None:
+        if not self.mic_test:
+            self.lbl_mic.configure(text="Проверка доступна только при запущенном Джарвисе.", text_color=ERR_COLOR)
+            return
+        self.btn_mic.configure(state="disabled")
+        self.lbl_mic.configure(text="Говори…", text_color=MUTED)
+        box = {}
+
+        def work():
+            try:
+                box["res"] = self.mic_test()
+            except Exception as e:  # noqa: BLE001
+                box["res"] = (False, str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+        def poll():
+            try:
+                if "res" not in box:
+                    self.win.after(200, poll)
+                    return
+                ok, text = box["res"]
+                self.btn_mic.configure(state="normal")
+                self.lbl_mic.configure(
+                    text=(("Услышал: " if ok else "Не получилось: ") + str(text)),
+                    text_color=OK_COLOR if ok else ERR_COLOR)
+            except tk.TclError:
+                pass
+
+        poll()
+
     def _browse(self, entry) -> None:
         p = filedialog.askopenfilename(parent=self.win, title="Выбери файл")
         if p:
@@ -1053,6 +1177,7 @@ class SettingsWindow:
                           "autoformat": bool(self.sw_dict_format.get()),
                           "confirm_unknown": bool(self.sw_dict_confirm.get()),
                           "indicator": bool(self.sw_dict_indicator.get())},
+            "stt": self._stt_form(),
         }
         phrase = self.v_password.get().strip()
         if phrase:

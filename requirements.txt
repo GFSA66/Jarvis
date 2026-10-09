@@ -11,5 +11,11 @@ psutil
 screen-brightness-control
 comtypes
 keyring
+numpy
+# --- Распознавание речи (STT). Основной режим офлайн на vosk, модель качается
+# при первом запуске в ~/.jarvis/models. Whisper (faster-whisper) — для диктовки.
+# Google (recognize_google) остаётся запасным и уже покрыт SpeechRecognition.
+vosk
+faster-whisper
 # Необязательно: чтение уведомлений Windows — pip install winsdk
 requests

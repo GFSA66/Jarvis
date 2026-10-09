@@ -36,6 +36,7 @@ from urllib.parse import quote_plus
 
 import jarvis_routing
 import jarvis_history
+import jarvis_stt
 
 
 _STARTUP_DATA_DIR = Path(os.environ.get("JARVIS_HOME") or (Path.home() / ".jarvis"))
@@ -272,11 +273,14 @@ DEFAULT_CONFIG = {
         "pc_context": True,              # рассказывать нейросети про железо и игры Steam
         "files": True,                   # доступ к файлам ПК: чтение, создание, редактирование
         "self_edit": True,               # нейросеть может редактировать файлы самого Джарвиса
-        "refine": True,                  # додумывать непонятые фразы: пунктуация, ошибки распознавания
+        "refine": False,                 # додумывать непонятые фразы нейросетью — только последний запасной шаг (по умолчанию выключено)
         "chat": {"attention_sec": 25, "history_turns": 6},  # диалог: сколько секунд помнить обращение без имени
     },
     # История запросов к Джарвису: %USERPROFILE%\.jarvis\history.jsonl
     # (команды «история запросов» и «очисти историю»)
+    # Распознавание речи (старый config.json без этой секции работает с дефолтами):
+    # engine: vosk (офлайн, по умолчанию) | whisper | google | hybrid
+    "stt": dict(jarvis_stt.DEFAULTS),
 }
 
 # Эти разделы при загрузке ЗАМЕНЯЮТСЯ целиком (а не дополняются значениями по умолчанию) —
@@ -2638,7 +2642,8 @@ def cmd_settings(t):
         root, CFG, save_user_config, AUTOSTART, jarvis_ai,
         say=lambda text: speaker.say(text) if speaker else None,
         history_read=_settings_history_read, history_clear=_settings_history_clear,
-        history_run=lambda text: threading.Thread(target=process, args=(_norm(text),), daemon=True).start()))
+        history_run=lambda text: threading.Thread(target=process, args=(_norm(text),), daemon=True).start(),
+        mic_test=mic_test))
 
 
 def _settings_history_read(query: str = "") -> list[dict]:
@@ -3505,29 +3510,208 @@ def _process_inner(text: str, refined: bool = False) -> None:
 
 recognizer = sr.Recognizer()
 audio_q: queue.Queue = queue.Queue(maxsize=5)
+STT_DEBUG = False  # включается флагом --stt-debug
+STT_DEBUG_LOG = DATA_DIR / "stt_debug.log"
+STT_ENGINE: jarvis_stt.STTEngine | None = None  # создаётся лениво (скачивание модели)
+
+
+def _stt_debug(line: str) -> None:
+    """Ротируемый журнал STT-диагностики (~/.jarvis/stt_debug.log)."""
+    try:
+        if STT_DEBUG_LOG.exists() and STT_DEBUG_LOG.stat().st_size > 1_000_000:
+            STT_DEBUG_LOG.replace(STT_DEBUG_LOG.with_name("stt_debug.log.1"))
+        with open(STT_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}\n")
+    except OSError:
+        pass
+    if STT_DEBUG:
+        print(f"[stt] {line}")
+
+
+def _stt_status() -> str:
+    """Короткое состояние распознавания для `--check`: движок, пакеты, модель."""
+    stt_cfg = {**jarvis_stt.DEFAULTS, **(CFG.get("stt") or {})}
+    engine = str(stt_cfg.get("engine") or "vosk")
+    pkgs = []
+    try:
+        import importlib.util as u  # noqa: PLC0415
+        for pkg, label in (("vosk", "vosk"), ("faster_whisper", "faster-whisper"),
+                           ("speech_recognition", "google")):
+            if u.find_spec(pkg):
+                pkgs.append(label)
+    except Exception:  # noqa: BLE001
+        pass
+    model = _stt_model_present(stt_cfg)
+    ready = "модель есть" if model else "модель будет скачана при запуске"
+    return (f"{engine} ({', '.join(pkgs) or 'нет пакетов'}; {ready})")
+
+
+def _stt_model_present(stt_cfg: dict) -> bool:
+    """Есть ли уже скачанная офлайн-модель (без запуска скачивания)."""
+    try:
+        kind = str(stt_cfg.get("model") or "small")
+        kind = kind if kind in jarvis_stt.VOSK_MODELS else "small"
+        name = jarvis_stt.VOSK_MODELS[kind][0]
+        return (jarvis_stt.models_dir(stt_cfg) / name / "am").exists()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def build_stt_grammar() -> list[str]:
+    """Слова грамматики Vosk: команды, алиасы, игры, сайты, имена, глаголы."""
+    words: list[str] = []
+    for intent in INTENTS:
+        for phrase in intent.phrases:
+            words.extend(str(phrase).split())
+        if intent.pattern:
+            words.extend(re.findall(r"[а-яa-zё]{4,}", intent.pattern))
+    words.extend(CFG["games"].keys())
+    words.extend(CFG["sites"].keys())
+    words.extend(CFG["urls"].keys())
+    words.extend(CFG["ai"]["names"])
+    words.extend((CFG.get("system", {}).get("app_aliases", {}) or {}).keys())
+    for c in CFG["commands"]:
+        words.extend(str(c.get("phrase", "")).split())
+    words.extend(("пожалуйста", "открой", "закрой", "запусти", "выключи", "включи",
+                  "сделай", "громче", "тише", "яркость", "громкость", "трек", "музыка",
+                  "список", "команд", "все", "заметки", "таймер", "будильник"))
+    return jarvis_stt.build_grammar(words)
+
+
+def stt_engine() -> jarvis_stt.STTEngine | None:
+    """Ленивая сборка STT-движка (модель качается при первом запуске в ~/.jarvis/models)."""
+    global STT_ENGINE
+    if STT_ENGINE is None:
+        try:
+            STT_ENGINE = jarvis_stt.STTEngine(
+                CFG.get("stt") or {}, grammar=build_stt_grammar(),
+                language=CFG["language"],
+                command_prompt="Джарвис: команды ПК, игры Steam, музыка, заметки, таймеры.")
+            _stt_debug(f"движок готов: {STT_ENGINE.cfg.get('engine')} "
+                       f"(модель {STT_ENGINE.cfg.get('model')})")
+        except Exception as e:
+            log_error("STT", e)
+            _stt_debug(f"ошибка сборки движка: {e}")
+            if notifier:
+                notify(f"Распознавание: {e}"[:140], ok=False)
+    return STT_ENGINE
+
+
+def _rms(chunk: bytes) -> int:
+    """RMS-энергия 16-бит чанка (audioop удалён в Python 3.13)."""
+    import array
+    a = array.array("h", chunk)
+    if not a:
+        return 0
+    acc = 0
+    for x in a:
+        acc += x * x
+    return int((acc / len(a)) ** 0.5)
+
+
+def mic_test(timeout: float = 12.0) -> tuple[bool, str]:
+    """Проверка микрофона: записать одну фразу и вернуть (ok, распознанный текст).
+
+    Используется кнопкой «Проверить микрофон» в настройках. Возвращает понятную
+    причину при ошибке (нет микрофона/тишина/низкая уверенность), чтобы владелец
+    сразу видел, что именно не так.
+    """
+    eng = stt_engine()
+    if eng is None:
+        return False, "движок распознавания не собрался (нет модели или зависимости)"
+    sample_rate = 16000
+    try:
+        with sr.Microphone() as source:
+            sample_rate = getattr(source, "SAMPLE_RATE", 16000)
+            recognizer.adjust_for_ambient_noise(source, duration=0.4)
+            vad = jarvis_stt.StreamVAD(margin=float(
+                (CFG.get("stt", {}) or {}).get("vad_energy_margin") or 2.0))
+            frames: list[bytes] = []
+            collecting = False
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                chunk = source.stream.read(source.CHUNK)
+                state = vad.feed(_rms(chunk))
+                if state == "speech":
+                    collecting = True
+                    frames.append(chunk)
+                elif collecting and state == "silence":
+                    break
+    except Exception as e:  # noqa: BLE001
+        return False, f"нет доступа к микрофону: {e}"
+    pcm = b"".join(frames)
+    if len(pcm) < sample_rate // 2:  # короче 0.5 с — скорее всего тишина
+        return False, "тишина — ничего не услышал, проверь микрофон"
+    result = eng.transcribe(pcm, sample_rate)
+    if result.rejected:
+        return False, f"не разобрал речь ({result.rejected})"
+    if not result.text:
+        return False, "пустая фраза — скажи, пожалуйста, команду"
+    return True, f"«{result.text}» (движок {result.engine}, уверенность {result.confidence:.2f})"
 
 
 def listener_loop(ready: threading.Event) -> None:
-    """Микрофон открыт постоянно, распознавание идёт в другом потоке —
-    поэтому фразы не теряются, пока Google думает."""
+    """Микрофон + собственный VAD: адаптивный порог шума, предзапись (не режет
+    первое слово), пауза после речи Джарвиса (подавление эха). PCM → audio_q."""
+    stt_cfg = {**jarvis_stt.DEFAULTS, **(CFG.get("stt") or {})}
+    vad = jarvis_stt.StreamVAD(margin=float(stt_cfg.get("vad_energy_margin") or 2.0))
+    prebuffer_frames = max(1, int(int(stt_cfg.get("prebuffer_ms") or 400) / 30))
+    echo_tail = max(0, int(int(stt_cfg.get("echo_tail_ms") or 400) / 30))
+    max_frames = 33 * 12  # фраза не длиннее 12 с, как раньше
+    sample_rate = 16000
     try:
         with sr.Microphone() as source:
-            recognizer.adjust_for_ambient_noise(source, duration=1)
+            sample_rate = getattr(source, "SAMPLE_RATE", 16000)
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
             ready.set()
+            prebuffer: list[bytes] = []
+            frames: list[bytes] = []
+            collecting = False
+            tail = 0
             while not STATE.stop.is_set():
+                chunk = source.stream.read(source.CHUNK)
                 if speaker and speaker.busy.is_set():
-                    source.stream.read(source.CHUNK)  # вычитываем и выбрасываем эхо Джарвиса
+                    # вычитываем эхо речи Джарвиса и держим хвост после неё
+                    tail = echo_tail
+                    vad.reset()
+                    prebuffer.clear()
+                    frames.clear()
+                    collecting = False
                     continue
-                try:
-                    audio = recognizer.listen(source, timeout=1, phrase_time_limit=12)
-                except sr.WaitTimeoutError:
+                if tail > 0:
+                    tail -= 1
                     continue
-                if speaker and speaker.busy.is_set():
-                    continue
-                try:
-                    audio_q.put_nowait(audio)
-                except queue.Full:
-                    pass
+                state = vad.feed(_rms(chunk))
+                if state == "speech":
+                    if not collecting:
+                        collecting = True
+                        frames = list(prebuffer)  # предзапись: не режем первое слово
+                    prebuffer.clear()
+                    frames.append(chunk)
+                    if len(frames) >= max_frames:
+                        collecting = False
+                        pcm = b"".join(frames)
+                        frames = []
+                        if len(pcm) > sample_rate:
+                            try:
+                                audio_q.put_nowait((pcm, sample_rate))
+                            except queue.Full:
+                                pass
+                elif collecting and state == "silence":
+                    # конец фразы
+                    collecting = False
+                    pcm = b"".join(frames)
+                    frames = []
+                    prebuffer.clear()
+                    if len(pcm) > sample_rate // 2:  # короче 0.5 с — шум
+                        try:
+                            audio_q.put_nowait((pcm, sample_rate))
+                        except queue.Full:
+                            pass
+                elif not collecting:
+                    prebuffer.append(chunk)
+                    if len(prebuffer) > prebuffer_frames:
+                        prebuffer.pop(0)
     except Exception as e:
         log_error("Микрофон", e)
         message = "Не удалось открыть микрофон. Проверь, что он подключён и разрешён в настройках Windows."
@@ -3550,22 +3734,37 @@ def main_loop() -> None:
     last_net_warning = 0.0
     while not STATE.stop.is_set():
         try:
-            audio = audio_q.get(timeout=0.5)
+            item = audio_q.get(timeout=0.5)
         except queue.Empty:
             if STATE.dictation_mode and ju and ju.dictation_idle_expired(
                     STATE.dictation_last_seen, time.time(), CFG.get("dictation", {}).get("idle_timeout_sec", 120)):
                 _dictation_stop("Режим диктовки выключен: две минуты тишины.")
             continue
+        if isinstance(item, tuple):
+            pcm, rate = item
+        else:  # совместимость со старым форматом queue (sr.AudioData)
+            pcm, rate = item.get_raw_data(), item.sample_rate
         try:
-            text = _norm(recognizer.recognize_google(audio, language=CFG["language"]))
+            eng = stt_engine()
+            if eng is not None:
+                result = eng.transcribe(pcm, rate)
+                text = _norm(result.text)
+                _stt_debug(f"engine={result.engine} conf={result.confidence:.2f} "
+                           f"rejected={result.rejected!r} text={result.text!r}")
+                if result.rejected:
+                    continue  # мусор — молча: ни в команды, ни в нейросеть
+            else:
+                # запасной путь: движок не собрался — старый онлайн Google
+                text = _norm(recognizer.recognize_google(
+                    sr.AudioData(pcm, rate, 2), language=CFG["language"]))
+                _stt_debug(f"engine=google(fallback) text={text!r}")
             print(f"Вы сказали: {text}")
             process(text)
-        except sr.UnknownValueError:
-            pass
-        except sr.RequestError as e:
-            log_error("Сервис распознавания", e)
+        except jarvis_stt.STTError as e:
+            log_error("Распознавание речи", e)
+            _stt_debug(f"ошибка STT: {e}")
             if time.time() - last_net_warning > 30:
-                notify("Нет связи с сервисом распознавания речи.", ok=False)
+                notify(f"Распознавание недоступно: {e}"[:140], ok=False)
                 last_net_warning = time.time()
         except Exception as e:
             log_error("Обработка команды", e)
@@ -3604,6 +3803,7 @@ def print_check() -> None:
         ("Горячая клавиша", CFG.get("integrations", {}).get("hotkey") or None),
         ("Telegram", "токен задан" if CFG.get("integrations", {}).get("telegram_token") else None),
         ("Discord", "webhook задан" if CFG.get("integrations", {}).get("discord_webhooks") else None),
+        ("Распознавание (STT)", _stt_status()),
         ("Папка данных", str(DATA_DIR)),
     ]
     lines = [f"  {'✓' if val else '✗'} {name:28} {val or 'не найдено'}" for name, val in rows]
@@ -3673,7 +3873,7 @@ def ask_test(question: str) -> None:
 
 
 def main() -> None:
-    global notifier, speaker, HOTKEY
+    global notifier, speaker, HOTKEY, STT_DEBUG
     ap = argparse.ArgumentParser(description="Джарвис — голосовой ассистент")
     ap.add_argument("--check", action="store_true", help="показать, что найдено на этом ПК")
     ap.add_argument("--list-voices", action="store_true", help="список голосов TTS")
@@ -3681,7 +3881,11 @@ def main() -> None:
     ap.add_argument("--ask", metavar="ВОПРОС", help="спросить нейросеть (нужен ключ в настройках)")
     ap.add_argument("--match", metavar="ФРАЗА", help="показать диагностику маршрутизации команды")
     ap.add_argument("--clipboard-test", action="store_true", help="проверить чтение текста из буфера обмена")
+    ap.add_argument("--stt-debug", action="store_true",
+                    help="показывать диагностику распознавания (движок, уверенность, текст) и писать stt_debug.log")
     args = ap.parse_args()
+    if args.stt_debug:
+        STT_DEBUG = True
     if args.check:
         print_check()
         return
@@ -3721,6 +3925,7 @@ def main() -> None:
 
     ready = threading.Event()
     threading.Thread(target=listener_loop, args=(ready,), daemon=True).start()
+    threading.Thread(target=stt_engine, daemon=True).start()  # заранее качаем/грузим модель
     ready.wait(15)  # приветствие — после калибровки шума, чтобы голос не сбил порог
     if not STATE.stop.is_set():
         notify("Джарвис слушает вас, господин.")
