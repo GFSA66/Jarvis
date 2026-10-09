@@ -228,7 +228,7 @@ def top_processes(limit: int = 5) -> list[dict]:
 
 
 def find_process(name_query: str) -> list:
-    """Процессы по имени (русские названия -> exe через alias-таблицу)."""
+    """Процессы по имени exe (русские названия -> exe через alias-таблицу)."""
     try:
         import psutil
     except ImportError:
@@ -238,11 +238,205 @@ def find_process(name_query: str) -> list:
     for p in psutil.process_iter(["name", "pid"]):
         try:
             name = str(p.info.get("name") or "")
-            if name_query in name.lower():
+            if name_query and name_query in name.lower():
                 hits.append(p)
         except Exception:  # noqa: BLE001, S110
             continue
     return hits
+
+
+# ---------------------------------------------------------------------------
+#  Закрытие окон по запросу пользователя (заголовок / exe / активное окно)
+# ---------------------------------------------------------------------------
+
+# Защита: эти окна по голосовой просьбе не закрываем
+PROTECTED_TITLES = ("джарвис", "jarvis")
+
+
+def visible_windows(limit: int = 200) -> list[tuple[int, str]]:
+    """[(hwnd, заголовок)] — видимые окна с непустым заголовком."""
+    import win32gui
+
+    out: list[tuple[int, str]] = []
+
+    def cb(hwnd, _):
+        if win32gui.IsWindowVisible(hwnd):
+            title = (win32gui.GetWindowText(hwnd) or "").strip()
+            if title:
+                out.append((hwnd, title))
+        return True
+
+    try:
+        win32gui.EnumWindows(cb, None)
+    except Exception:  # noqa: BLE001, S110
+        pass
+    return out[:limit]
+
+
+def open_window_titles(limit: int = 5) -> list[str]:
+    """Топ-заголовков для сообщения «Открытые окна: …»."""
+    return [t for _, t in visible_windows(limit)]
+
+
+def _send_wm_close(hwnd: int) -> None:
+    """WM_CLOSE окну; для UWP (ApplicationFrameHost) — ещё и дочернему окну приложения."""
+    import psutil
+    import win32con
+    import win32gui
+
+    win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+    try:
+        _, pid = win32gui.GetWindowThreadProcessId(hwnd)
+        pname = (psutil.Process(pid).name() or "").lower()
+    except Exception:  # noqa: BLE001, S110
+        return
+    if pname != "applicationframehost.exe":
+        return
+    # UWP: приложение живёт в своём процессе, фрейм — только обёртка:
+    # WM_CLOSE дочернему окну реального приложения.
+    children: list[int] = []
+    try:
+        win32gui.EnumChildWindows(hwnd, lambda h, _: children.append(h) or True, None)
+    except Exception:  # noqa: BLE001, S110
+        return
+    for child in children:
+        try:
+            _, cpid = win32gui.GetWindowThreadProcessId(child)
+            if cpid != pid:
+                win32gui.PostMessage(child, win32con.WM_CLOSE, 0, 0)
+        except Exception:  # noqa: BLE001, S110
+            continue
+
+
+def window_is_elevated(hwnd: int) -> bool:
+    """Окно запущено от администратора — WM_CLOSE от обычного процесса не пройдёт."""
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+        import win32gui
+
+        PROCESS_QUERY_LIMITED = 0x1000
+        TOKEN_QUERY = 0x0008
+        _, pid = win32gui.GetWindowThreadProcessId(hwnd)
+        hproc = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED, False, pid)
+        if not hproc:
+            return False
+        try:
+            token = ctypes.c_void_p()
+            if not ctypes.windll.advapi32.OpenProcessToken(hproc, TOKEN_QUERY, ctypes.byref(token)):
+                return False
+            try:
+                elevation = wt.DWORD()
+                size = wt.DWORD(ctypes.sizeof(elevation))
+                ok = ctypes.windll.advapi32.GetTokenInformation(
+                    token.value, 20, ctypes.byref(elevation), size, ctypes.byref(size))
+                return bool(ok and elevation.value)
+            finally:
+                ctypes.windll.kernel32.CloseHandle(token)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(hproc)
+    except Exception:  # noqa: BLE001, S110
+        return False
+
+_ACTIVE_TARGETS = {"это", "окно", "текущее", "активное", "данное", "сейчас",
+                   "это окно", "текущее окно", "активное окно", "данное окно"}
+
+
+def close_window_by_name(name: str, aliases: dict | None = None) -> dict:
+    """Закрыть окно: (1) алиас, (2) заголовок окна, (3) имя exe, (4) активное окно.
+
+    Возвращает {"closed": int, "remaining": int, "pids": [..]}.
+    При неудаче — ActionError с понятным сообщением и списком открытых окон,
+    а не молчаливое «Завершено процессов: 0».
+    """
+    import time as _time
+
+    target = (name or "").strip().lower()
+    if not target:
+        raise ActionError("Не понял, какое окно закрыть.")
+
+    # (4) «закрой это / окно / текущее» — активное окно, с защитой
+    if target in _ACTIVE_TARGETS:
+        win = active_window()
+        if not win["hwnd"]:
+            raise ActionError("Нет активного окна — нечего закрывать.")
+        title_l = (win["title"] or "").lower()
+        if any(p in title_l for p in PROTECTED_TITLES):
+            raise ActionError(f"Не буду закрывать окно Джарвиса («{win['title']}»).")
+        _send_wm_close(win["hwnd"])
+        _time.sleep(0.8)
+        try:
+            import win32gui
+            alive = bool(win32gui.IsWindow(win["hwnd"]))
+        except Exception:  # noqa: BLE001, S110
+            alive = False
+        if not alive:
+            return {"closed": 1, "remaining": 0, "pids": [win["pid"]]}
+        if window_is_elevated(win["hwnd"]):
+            raise ActionError(
+                f"Окно «{win['title']}» не закрылось: оно от администратора. "
+                "Запусти Джарвиса от администратора, чтобы закрывать такие окна.")
+        return {"closed": 0, "remaining": 1, "pids": [win["pid"]]}
+
+    # (1) алиас из настроек: «блокнот» -> notepad.exe
+    resolved = ((aliases or {}).get(target) or target).strip()
+    words = [w for w in resolved.split() if w and w not in ("окно", "приложение", "программа")]
+
+    # (2) заголовок окна: все слова запроса есть в заголовке (без учёта регистра)
+    hwnds = [h for h, title in visible_windows()
+             if words and all(w in title.lower() for w in words)
+             and not any(p in title.lower() for p in PROTECTED_TITLES)]
+
+    # (3) имя exe
+    pids = set()
+    try:
+        pids = {p.pid for p in find_process(resolved)}
+    except ActionError:
+        pids = set()
+
+    if not hwnds and not pids:
+        titles = open_window_titles(5)
+        listing = "; ".join(titles) if titles else "ничего не открыто"
+        raise ActionError(f"Не нашёл окно «{name}». Открытые окна: {listing}")
+
+    closed = 0
+    for hwnd in hwnds:
+        _send_wm_close(hwnd)
+    if hwnds:
+        _time.sleep(1.0)  # даём приложению закрыться штатно (в т.ч. спросить про файлы)
+        try:
+            import win32gui
+            remaining = [h for h in hwnds if win32gui.IsWindow(h) and win32gui.IsWindowVisible(h)]
+        except Exception:  # noqa: BLE001, S110
+            remaining = []
+        if remaining:
+            if any(window_is_elevated(h) for h in remaining):
+                raise ActionError(
+                    f"Окно «{name}» не закрылось: оно от администратора. "
+                    "Запусти Джарвиса от администратора, чтобы закрывать такие окна.")
+            return {"closed": len(hwnds) - len(remaining), "remaining": len(remaining),
+                    "pids": sorted(pids)}
+        closed = len(hwnds)
+    return {"closed": closed, "remaining": 0, "pids": sorted(pids)}
+
+
+def kill_pids(pids) -> int:
+    """Принудительное завершение процессов по pid (только после подтверждения)."""
+    try:
+        import psutil
+    except ImportError:
+        raise ActionError("Нужен psutil: pip install psutil") from None
+    killed = 0
+    for pid in pids:
+        try:
+            p = psutil.Process(int(pid))
+            if (p.name() or "").lower() in SYSTEM_PROCESSES:
+                continue
+            p.kill()
+            killed += 1
+        except Exception:  # noqa: BLE001, S110
+            continue
+    return killed
 
 
 def close_process(name: str, force: bool = False) -> int:

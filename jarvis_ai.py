@@ -680,7 +680,10 @@ def _steam_install(name: str) -> str:
         return f"Steam не запустился — открыл страницу «{title}» в браузере (appid {appid})."
 
 
-def _steam_launch(name: str) -> str:
+def _steam_launch(name: str, allowed: bool = False) -> str:
+    if not allowed:
+        return ("Скажите явно «запусти <название>», и я запущу игру. "
+                "По рекомендации я не запускаю игры без прямой просьбы.")
     appid, title = _steam_resolve(name)
     os.startfile(f"steam://rungameid/{appid}")
     return f"Запускаю «{title}»."
@@ -803,7 +806,7 @@ def _run_tool(name: str, args: dict, on_write, ctx=None) -> str:
         return _steam_install(args.get("name"))
 
     if name == "steam_launch":
-        return _steam_launch(args.get("name"))
+        return _steam_launch(args.get("name"), bool((ctx or {}).get("steam_launch_ok")))
 
     if name == "type_text":
         return _type_text(args.get("text"))
@@ -1045,7 +1048,10 @@ class Assistant:
                 "речь автоматически чистится: опечатки и паразиты убираются, знаки препинания ставятся), "
                 "ищи, ставь и запускай игры Steam (steam_find, steam_install, steam_launch), "
                 "добавляй свои игры/сайты/команды (add_game, add_site, add_command) — после добавления скажи, "
-                "какой фразой это теперь можно запускать."
+                "какой фразой это теперь можно запускать. "
+                "Отрицания пользователя обязательны: «только не X», «кроме Y», «не запускай Z» — не запускай "
+                "и не предлагай эти игры/приложения, учитывай исключения в рекомендациях. "
+                "Игру запускай только по явной просьбе («запусти …»), иначе — только рекомендация."
             )
         if ai.get("self_edit", True) and ctx.get("self_files"):
             tail = ("Изменения в код рядом с exe вступят в силу после пересборки: запусти build_exe.bat "
@@ -1088,6 +1094,13 @@ class Assistant:
         """Диалог с инструментами: модель может смотреть и менять файлы на ПК,
         включая файлы самого Джарвиса. Вызовов за вопрос — не больше MAX_TOOL_STEPS."""
         self.last_tools = []
+        ctx = self.get_context()
+        # Запуск игры нейросетью — только по явной просьбе в последней реплике
+        # («во что поиграть, только не киберпанк» → рекомендация, не запуск).
+        last_user = next((str(m.get("content") or "") for m in reversed(messages)
+                          if m.get("role") == "user"), "")
+        ctx["steam_launch_ok"] = bool(re.search(
+            r"\b(?:запусти|запустить|запускай|открой игру|включи игру)\b", last_user.lower()))
         if not ai.get("files", True):
             return chat(ai, messages)
         text = ""
@@ -1111,7 +1124,7 @@ class Assistant:
                     except Exception as e:  # noqa: BLE001 — ошибку отдаём модели, а не роняем вопрос
                         result = f"Ошибка: {e}"
                 else:
-                    result = run_tool(name, args, on_write=self.on_write, ctx=self.get_context())
+                    result = run_tool(name, args, on_write=self.on_write, ctx=ctx)
                 self.last_tools.append(name)
                 messages.append({"role": "tool", "tool_call_id": cid, "content": str(result)})
         # закончились шаги — пусть модель ответит по уже полученным данным

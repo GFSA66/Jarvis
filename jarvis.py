@@ -988,6 +988,7 @@ class State:
         self.dictation_buffer = ""
         self.dictation_last_chunk = ""
         self.pending_confirm: dict | None = None
+        self.last_close_pids: list = []  # pid'ы для принудительного закрытия после подтверждения
 
 
 STATE = State()
@@ -1363,7 +1364,7 @@ def is_help(t: str) -> bool:
 
 
 def is_pc(text: str) -> bool:
-    return is_word(text, "пк", "комп", "компьютер", "компьютера", "ноутбук")
+    return jarvis_routing.is_pc_target(text)
 
 
 # Разделители цепочки команд: «открой стим и заметки», «запусти майнкрафт, потом музыку»
@@ -1373,8 +1374,12 @@ CHAIN_SPLIT_RE = re.compile(r"\s*(?:,|\bи\b|\bа\s+также\b|\bпотом\b|
 def split_chain(text: str) -> list:
     """Фразу «открой стим и заметки» -> [«открой стим», «заметки»].
     Пустые куски выбрасываем. Делим осторожно: «создай …» / «удали …» / «надиктуй …»
-    с « и » внутри не трогаем, чтобы не развалить «создай папку моды и в ней файл список»."""
+    с « и » внутри не трогаем, чтобы не развалить «создай папку моды и в ней файл список».
+    Вопросы («во что поиграть») и фразы с отрицанием («только не киберпанк»)
+    не режутся — иначе «только не киберпанк» превратилось бы в отдельную команду запуска."""
     stripped = text.strip()
+    if not jarvis_routing.can_split_chain(stripped):
+        return [stripped]
     if parse_create(stripped) is not None:
         return [stripped]
     if re.search(r"\b(?:удали|удалить|убери|сотри|стереть)\b", stripped):
@@ -2489,8 +2494,20 @@ def cmd_genshin(t):
     launch_app(find_genshin(), "Genshin Impact", "genshin")
 
 
+def launch_ok(t: str) -> bool:
+    """Запуск запрещён при отрицании или вопросе-рекомендации:
+    «не запускай майнкрафт», «во что поиграть, только не киберпанк»."""
+    return not jarvis_routing.launch_blocked(t)
+
+
 def _game_key(t):
-    return next((k for k in CFG["games"] if re.search(r"\b" + re.escape(k), t)), None)
+    """Название игры из CFG — но не в зоне отрицания и не по вопросу-рекомендации:
+    «во что поиграть, только не киберпанк» не должен запускать Киберпанк."""
+    if jarvis_routing.launch_blocked(t):
+        return None
+    negated = jarvis_routing.negated_terms(t, CFG["games"].keys())
+    return next((k for k in CFG["games"]
+                 if k not in negated and re.search(r"\b" + re.escape(k), t)), None)
 
 
 def cmd_steam_game(t):
@@ -2691,19 +2708,46 @@ def cmd_processes(t):
 
 
 def cmd_close_any(t):
-    m = re.search(r"\b(?:закр\w*|выключ\w*|останов\w*|заверш\w*)\s+(.+)", t)
-    name = (m.group(1) if m else re.sub(r"\b(?:закр\w*|выключ\w*|останов\w*|заверш\w*)\b", "", t)).strip(" ,.!?")
-    alias = (CFG.get("system", {}).get("app_aliases", {}) or {}).get(name, name)
+    aliases = CFG.get("system", {}).get("app_aliases", {}) or {}
+    req = jarvis_routing.resolve_close(t, aliases)
+    if req["kind"] == "power_hint":
+        notify(req["message"], ok=False)
+        return
+    if req["kind"] == "error":
+        notify(req["message"] or "Не понял, какое окно закрыть.", ok=False)
+        return
+    label = req["label"]
+    target = req["target"] or "это"
+
+    def force_close():
+        def work():
+            try:
+                killed = js.kill_pids(STATE.last_close_pids or [])
+            except Exception as e:
+                log_error("Принудительное закрытие", e)
+                notify(f"Не получилось: {e}", ok=False)
+                return
+            journal_add(f"принудительно завершено процессов: {killed}")
+            notify(f"Завершено процессов: {killed}.")
+        confirm("жёсткое закрытие", f"Окна {label} не закрываются. Завершить процесс принудительно?",
+                work, True)
+
     def work():
-        count = js.close_process(alias, False)
-        if count:
-            journal_add(f"мягко закрыто: {name}")
-            notify(f"Закрываю {name}.")
-        else:
-            confirm("жёсткое закрытие", f"Окна {name} не найдены. Принудительно завершить процесс?",
-                    lambda: _async("Закрытие процесса", lambda: notify(
-                        f"Завершено процессов: {js.close_process(alias, True)}.")), True)
-    confirm("закрытие приложения", f"Закрыть {name}?", lambda: _async("Закрытие приложения", work), True)
+        try:
+            res = js.close_window_by_name(target, aliases)
+        except Exception as e:  # ActionError и прочие — сообщаем причину, а не «0»
+            log_error("Закрытие окна", e)
+            notify(str(e), ok=False)
+            return
+        STATE.last_close_pids = res.get("pids") or []
+        journal_add(f"закрыто окон: {res['closed']} ({label})")
+        if res.get("remaining"):
+            confirm("незакрытые данные",
+                    f"В окне «{label}», возможно, есть несохранённые данные. "
+                    "Закрыть без сохранения?", force_close, True)
+            return
+        notify(f"Закрыл {label}." + (f" Окон: {res['closed']}." if res["closed"] > 1 else ""))
+    confirm("закрытие приложения", f"Закрыть {label}?", lambda: _async("Закрытие приложения", work), True)
 
 
 def cmd_screenshot(t):
@@ -3021,7 +3065,7 @@ COMMANDS = [
     Cmd(lambda t: jarvis_routing.close_verb(t) and not has(t, "браузер", "хром", "стим", "дискорд", "телеграм", "музык"), cmd_close_any, False),
     # раньше своих команд: «загугли кс2» должно искать, а не запускать игру
     Cmd(lambda t: bool(SEARCH_RE.search(t)) and not TRACK_RE.search(t), cmd_search, False),
-    Cmd(lambda t: _custom_match(t) is not None, cmd_custom, False),  # свои команды — раньше встроенных
+    Cmd(lambda t: _custom_match(t) is not None and launch_ok(t), cmd_custom, False),  # свои команды — раньше встроенных
     Cmd(lambda t: has(t, "выключ") and is_pc(t), cmd_shutdown, True),
     Cmd(lambda t: has(t, "перезагруз") and is_pc(t), cmd_restart, True),
     Cmd(lambda t: has(t, "заметк", "запис") and has(t, "откр", "покаж", "показ", "прочита",
@@ -3055,12 +3099,13 @@ COMMANDS = [
     Cmd(lambda t: has(t, "музык") and CLOSE(t), lambda t: close_music_windows(), False),
     Cmd(lambda t: has(t, "музык"), lambda t: open_music(), False),
     Cmd(lambda t: has(t, "песн"), lambda t: threading.Thread(target=_resume_last_track, daemon=True).start(), False),
-    Cmd(lambda t: has(t, "геншин", "genshin"), cmd_genshin, True),
+    Cmd(lambda t: has(t, "геншин", "genshin") and launch_ok(t), cmd_genshin, True),
     Cmd(lambda t: _game_key(t) is not None, cmd_steam_game, True),
-    Cmd(lambda t: has(t, "майнкрафт", "minecraft"),
+    Cmd(lambda t: has(t, "майнкрафт", "minecraft") and launch_ok(t),
         lambda t: launch_app(find_minecraft(), "Minecraft", "minecraft"), True),
-    Cmd(lambda t: has(t, "призм", "prism"), lambda t: launch_app(find_prism(), "Prism Launcher", "prism"), True),
-    Cmd(lambda t: has(t, "роблокс", "roblox"), U("roblox"), True),
+    Cmd(lambda t: has(t, "призм", "prism") and launch_ok(t),
+        lambda t: launch_app(find_prism(), "Prism Launcher", "prism"), True),
+    Cmd(lambda t: has(t, "роблокс", "roblox") and launch_ok(t), U("roblox"), True),
     Cmd(lambda t: has(t, "логик", "logik"), U("logika"), False),
     Cmd(lambda t: has(t, "стим", "steam") and CLOSE(t), lambda t: close_app("steam.exe", "Steam"), False),
     Cmd(lambda t: has(t, "стим", "steam"), cmd_steam, True),
@@ -3102,12 +3147,10 @@ def _chain_run(parts: list, addressed: bool) -> bool:
         if cmd is None:
             trial = part
             cmd = next((c for c in COMMANDS if c.match(part)), None)
-        if cmd is None and ai_ready():
-            q = ai_question(part)
-            if q and jarvis_ai.is_question(q) and not is_help(q):
-                matched.append((None, q))  # вопрос нейросети — тоже часть цепочки
-                continue
         if cmd is None:
+            # Обе части цепочки должны быть валидными командами — иначе вызывающий
+            # откатывается на обычную логику для целой фразы («во что поиграть, только
+            # не киберпанк» не должно разваливаться на «команды»).
             return False
         if cmd.run in _SINGLE_RUNS:  # выход/сон/голос/забывание — только отдельно, не в цепочке
             return False
@@ -3158,6 +3201,16 @@ def process(text: str, refined: bool = False) -> None:
         if wake["word"] not in text:
             return
         text = text.replace(wake["word"], "", 1).strip()
+
+    # Питание ПК — самый высокий приоритет: «выключи пк» никогда не доходит
+    # до обработчика закрытия окон, даже если STT исказило слово.
+    power = jarvis_routing.power_intent(text)
+    if power:
+        {"shutdown": cmd_shutdown, "restart": cmd_restart,
+         "cancel": cmd_cancel_shutdown, "sleep": cmd_power,
+         "hibernate": cmd_power, "lock": cmd_power}[power](text)
+        history_add("команда", text, "выполнена")
+        return
 
     # Обращение к Джарвису: слово-активатор уже проверено выше, иначе ищем имя в фразе.
     # Если Джарвис «держит внимание» (только что говорили) — имя можно не называть.
@@ -3214,6 +3267,12 @@ def process(text: str, refined: bool = False) -> None:
                 if addressed and cmd.run not in (cmd_history, cmd_remind, cmd_reminders, cmd_dictate):
                     history_add("команда", text, "выполнена")
             return
+
+    # Локально ничего не понято: вопрос-рекомендация («во что поиграть, только не
+    # киберпанк») уходит нейросети целиком — вместе с исключениями, без запуска игр.
+    if ai_ready() and jarvis_routing.is_recommendation(text):
+        ask_ai(ai_question(text) or text)
+        return
 
     # Локально ничего не понято: даём нейросети додумать фразу (ошибки
     # распознавания, пунктуация) и пробуем выполнить ещё раз — уже без уточнения,
