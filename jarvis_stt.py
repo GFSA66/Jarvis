@@ -127,7 +127,7 @@ class VoskBackend:
             import vosk  # noqa: PLC0415
         except ImportError:
             raise STTError("Бэкенд vosk не установлен: pip install vosk") from None
-        vosk.Set_log_level(-1)
+        vosk.SetLogLevel(-1)
         self._vosk = vosk
         self._grammar = list(grammar or [])
         self._use_grammar = use_grammar
@@ -141,13 +141,23 @@ class VoskBackend:
             gram = json.dumps(self._grammar + ["[unk]"], ensure_ascii=False)
         rec = self._vosk.KaldiRecognizer(self._model, rate, gram) if gram \
             else self._vosk.KaldiRecognizer(self._model, rate)
+        rec.SetWords(True)  # без этого FinalResult не отдаёт conf по словам
         rec.AcceptWaveform(bytes(pcm))
         try:
             data = json.loads(rec.FinalResult())
         except json.JSONDecodeError:
             return "", 0.0
         text = str(data.get("text") or "").strip()
-        conf = float(data.get("confidence") or 0.0)
+        # Верхнеуровневого confidence в FinalResult нет — берём среднее conf слов.
+        words = data.get("result") or []
+        confs = [float(w.get("conf", 0.0)) for w in words
+                 if isinstance(w, dict) and w.get("conf") is not None]
+        if text and confs:
+            conf = sum(confs) / len(confs)
+        elif text:
+            conf = 0.7  # текст есть, но conf недоступен — середина, как у Google
+        else:
+            conf = 0.0
         return text, conf
 
 

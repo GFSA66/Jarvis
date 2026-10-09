@@ -7,6 +7,65 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import jarvis_stt as stt  # noqa: E402
 
 
+def _fake_vosk_module(payload):
+    """Собрать заглушку пакета vosk, чей FinalResult отдаёт payload."""
+    import json  # noqa: PLC0415
+
+    class Mod:
+        @staticmethod
+        def SetLogLevel(level):
+            pass
+
+        class Model:
+            def __init__(self, path):
+                pass
+
+        class Rec:
+            def __init__(self, model, rate, grammar=""):
+                pass
+
+            def SetWords(self, flag):
+                pass
+
+            def AcceptWaveform(self, pcm):
+                pass
+
+            def FinalResult(self):
+                return json.dumps(payload, ensure_ascii=False)
+
+        SetLogLevel = SetLogLevel
+        Model = Model
+        KaldiRecognizer = Rec
+
+    return Mod
+
+
+def test_vosk_confidence_from_word_confs(monkeypatch):
+    """Уверенность = среднее conf по словам (FinalResult без верхнеуровневого confidence)."""
+    import sys  # noqa: PLC0415
+    monkeypatch.setattr(stt, "ensure_vosk_model", lambda model, cfg: "x")
+    payload = {"text": "выключи компьютер",
+               "result": [{"word": "выключи", "conf": 0.9},
+                          {"word": "компьютер", "conf": 0.7}]}
+    monkeypatch.setitem(sys.modules, "vosk", _fake_vosk_module(payload))
+    backend = stt.VoskBackend({"model": "small"}, grammar=["выключи", "компьютер"])
+    text, conf = backend.transcribe(b"", 16000)
+    assert text == "выключи компьютер"
+    assert abs(conf - 0.8) < 1e-9, conf
+
+
+def test_vosk_text_without_word_conf_defaults(monkeypatch):
+    """Текст есть, но conf по словам нет — дефолт 0.7 (не 0), чтобы не резало всё."""
+    import sys  # noqa: PLC0415
+    monkeypatch.setattr(stt, "ensure_vosk_model", lambda model, cfg: "x")
+    payload = {"text": "джарвис", "result": []}
+    monkeypatch.setitem(sys.modules, "vosk", _fake_vosk_module(payload))
+    backend = stt.VoskBackend({"model": "small"}, grammar=["джарвис"])
+    text, conf = backend.transcribe(b"", 16000)
+    assert text == "джарвис"
+    assert conf == 0.7, conf
+
+
 def test_defaults_merge_for_old_config():
     eng = stt.STTEngine({})  # старый config.json без секции «stt»
     assert eng.cfg["engine"] == "vosk"
