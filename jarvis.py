@@ -991,6 +991,7 @@ class State:
         self.pending_confirm: dict | None = None
         self.last_close_pids: list = []  # pid'ы для принудительного закрытия после подтверждения
         self.history_custom: tuple | None = None  # своя запись истории от текущей команды
+        self.pending_clarify: tuple | None = None  # (opts, исходная фраза) при переспросе
 
 
 STATE = State()
@@ -1362,7 +1363,7 @@ def is_word(text: str, *words: str) -> bool:
 
 
 def is_help(t: str) -> bool:
-    return "список команд" in t or t.strip() == "помощь"
+    return "список команд" in t or "все команды" in t or t.strip() == "помощь"
 
 
 def is_pc(text: str) -> bool:
@@ -1407,7 +1408,24 @@ class Cmd:
         self.name = raw.removeprefix("cmd_") if raw != "<lambda>" else "builtin"
 
 
-def commands_text() -> str:
+def commands_text(full: bool = False) -> str:
+    """Короткий сгруппированный список (по умолчанию) или полный по «все команды»."""
+    if not full:
+        return f"""Главные команды Джарвиса (группы):
+1. Питание: «выключи/перезагрузи компьютер», «отмена», «режим сна», «заблокируй ПК»
+2. Окна: «закрой блокнот/браузер/стим/это окно»; «открой настройки»
+3. Звук и экран: «громче/тише/громкость на 30», «яркость 70», «выключи звук»
+4. Музыка: «включи музыку», «включи/найди трек <название>», «пауза», «следующий трек»
+5. Игры: «запусти <игру>» ({", ".join(sorted(CFG["games"])[:6])}…), «запусти тесты»
+6. Сайты: «открой <сайт>» ({", ".join(sorted(CFG["sites"])[:6])}…), «загугли <запрос>»
+7. Заметки: «запиши <текст>», «открой заметки», «очисти заметки»
+8. Напоминания: «напомни <что> через 10 минут / в 20:00», «покажи напоминания»
+9. Таймеры: «таймер на 10 минут», «будильник на 7:30», «сколько осталось»
+10. Диктовка: «режим диктовки», «напечатай <текст>», «закончить диктовку»
+11. Утилиты: «сделай скриншот», «что запущено», «брось d20», «подбрось монетку»
+12. Нейросеть: «Джарвис, <вопрос>»; «забудь разговор»
+13. Служебное: «список команд», «все команды», «история запросов», «голос»
+Мои команды: {len(CFG["commands"])} (скажи «все команды» — полный список)"""
     return f"""Список команд Джарвиса:
 — выход — завершить программу
 — музыка — открыть YouTube Music; закрой музыку — закрыть все окна YouTube Music
@@ -2241,8 +2259,12 @@ def show_text(name: str, text: str) -> None:
 
 
 def cmd_help(t):
+    if "все команды" in t:
+        show_text("commands.txt", commands_text(full=True))
+        notify("Полный список команд открыт.")
+        return
     show_text("commands.txt", commands_text())
-    notify("Список команд открыт." if sys.stdout is None else "Все команды я вывел в консоль.")
+    notify("Список команд открыт. Скажи «все команды», чтобы увидеть полный.")
 
 
 def cmd_voice(t):
@@ -3134,6 +3156,140 @@ COMMANDS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+#  Декларативный реестр интентов (jarvis_intents): приоритетная таблица.
+#  Матчится ДО legacy-лямбд COMMANDS; сами лямбды остаются как fallback для
+#  редких фраз — поведение не ломается, порядок строк больше не решает.
+# ---------------------------------------------------------------------------
+import jarvis_intents  # noqa: E402
+from jarvis_intents import Intent  # noqa: E402
+
+INTENTS: list[Intent] = [
+    # питание/выход/пауза
+    Intent("exit", ("выход", "выйти"), 0),
+    Intent("voice", ("голос",), 1),
+    Intent("forget", ("забудь разговор", "новый разговор"), 1),
+    # управление окнами
+    Intent("close_app", ("закрой блокнот", "закрой notepad", "закрой настройки",
+                         "закрой ютуб", "закрой ютьюб", "закрой youtube"), 10,
+           pattern=r"\b(?:закрой|закрыть)\s+(?:блокнот\w*|notepad|настройк\w*|ют[ую]б\w*|youtube)\b"),
+    Intent("close_music", ("закрой музыку",), 11),
+    # громкость/яркость (app_volume — раньше, как в legacy-порядке)
+    Intent("app_volume", (), 19, pattern=r".+\s+(?:тише|громче|громкость\s+на)"),
+    Intent("volume", ("громче", "тише", "громкость", "убавь", "прибавь",
+                      "выключи звук", "включи звук"), 20),
+    Intent("brightness", ("ярче", "темнее", "яркость"), 21,
+           pattern=r"\bяркость\s+\d+"),
+    # медиа
+    Intent("media", ("пауза", "играй", "что сейчас играет", "следующий трек",
+                     "дальше трек", "предыдущий трек", "назад трек", "верни трек"), 25),
+    Intent("track", (), 26, pattern=TRACK_RE.pattern),
+    # запуск приложений (guard launch_ok накладывается при сборке ниже)
+    Intent("open_music", ("включи музыку", "открой музыку", "включить музыку"), 30),
+    Intent("steam_game", tuple(CFG["games"].keys()), 32),
+    Intent("genshin", ("геншин", "genshin"), 32),
+    Intent("minecraft", ("майнкрафт", "minecraft"), 32),
+    Intent("prism", ("призм", "prism"), 32),
+    Intent("roblox", ("роблокс", "roblox"), 32),
+    # поиск
+    Intent("search", (), 40, pattern=SEARCH_RE.pattern),
+    # заметки/напоминания/таймеры/диктовка
+    Intent("gamebar", ("запиши последние тридцать секунд", "запиши последние 30 секунд"), 48),
+    Intent("notes", ("открой заметки", "покажи заметки", "очисти заметки",
+                     "удали заметки", "прочитай заметки"), 50),
+    Intent("note", ("запиши", "заметка", "заметку"), 51),
+    Intent("reminders", ("покажи напоминания", "очисти напоминания", "удали напоминания"), 52),
+    Intent("remind", (), 53, pattern=r"\bнапомни\b"),
+    Intent("todo", ("список дел", "добавь в список дел", "очисти выполненные",
+                    "отметь выполненным"), 54),
+    Intent("timer", ("таймер", "будильник", "засеки", "сколько осталось",
+                     "отмени таймер", "секундомер"), 55),
+    Intent("dictate", ("режим диктовки", "диктуй"), 56,
+           pattern=r"\b(?:надиктуй|диктуй|диктовка|напечатай|напечать|набери|набрать|"
+                   r"вставь|вставить|продиктуй)\b"),
+    # игры-броски, буфер обмена
+    Intent("dice", (), 58,
+           pattern=r"\b(?:брос|кин|бросок)\w*\s+.*(?:\bd\d|\bд\d|куб|кост)|подбрось монет"),
+    Intent("translate_clipboard", ("переведи буфер",), 59),
+    Intent("clipboard", ("прочитай буфер", "прочитай выделенное", "прочти выделенный",
+                         "озвучь выделенное", "читай выделенное", "что в буфере",
+                         "озвучь буфер"), 59),
+    # служебное
+    Intent("screenshot", ("сделай скриншот", "снимок экрана"), 62),
+    Intent("processes", ("что запущено", "грузит процессор"), 63),
+    Intent("help", ("список команд", "помощь", "все команды"), 65),
+    Intent("history", ("история запросов", "что я говорил", "очисти историю"), 66),
+]
+
+_LAUNCH_GUARD = {"steam_game", "genshin", "minecraft", "prism", "roblox", "open_music"}
+
+
+def _intent_matcher(intent: Intent):
+    """Matcher интента: реестрный скор + запрет запусков при отрицаниях."""
+    def match(t: str) -> bool:
+        if intent.name in _LAUNCH_GUARD and not launch_ok(t):
+            return False
+        if intent.name == "close_app" and has(t, "браузер", "хром", "стим", "дискорд",
+                                              "телеграм", "музык"):
+            return False  # у этих окон свои правила в legacy-порядке
+        return intent.score(jarvis_intents.tokenize(t), jarvis_intents.normalize(t)) >= 1.0
+    return match
+
+
+_INTENT_RUNS = {
+    "exit": cmd_exit, "voice": cmd_voice, "forget": cmd_forget,
+    "close_app": cmd_close_any, "close_music": lambda t: close_music_windows(),
+    "app_volume": cmd_app_volume, "volume": cmd_volume, "brightness": cmd_brightness,
+    "media": cmd_media, "track": cmd_track, "open_music": lambda t: open_music(),
+    "steam_game": cmd_steam_game, "genshin": cmd_genshin,
+    "minecraft": lambda t: launch_app(find_minecraft(), "Minecraft", "minecraft"),
+    "prism": lambda t: launch_app(find_prism(), "Prism Launcher", "prism"),
+    "roblox": U("roblox"), "search": cmd_search,
+    "gamebar": cmd_gamebar, "notes": cmd_notes, "note": cmd_note,
+    "reminders": cmd_reminders, "remind": cmd_remind, "todo": cmd_todo,
+    "timer": cmd_timer, "dictate": cmd_dictate, "dice": cmd_dice,
+    "translate_clipboard": cmd_translate_clipboard, "clipboard": cmd_clipboard,
+    "screenshot": cmd_screenshot, "processes": cmd_processes,
+    "help": cmd_help, "history": cmd_history,
+}
+
+# Человекочитаемые подписи для переспроса «Ты имел в виду…?»
+INTENT_LABELS = {
+    "steam_game": "запуск игры", "genshin": "Геншин", "minecraft": "Minecraft",
+    "prism": "Prism Launcher", "roblox": "Roblox", "open_music": "музыка",
+    "volume": "громкость", "app_volume": "громкость приложения", "note": "заметка",
+    "notes": "заметки", "track": "трек", "media": "медиа-плеер", "close_app": "закрыть окно",
+}
+
+
+def _registry_match(text: str) -> str | None:
+    """Найти интент по декларативному реестру. При ничьей — переспрос.
+
+    Возвращает «clarified» (переспрос отправлен) или None (ничего не найдено);
+    найденный интент выполняется внутри.
+    """
+    hits = jarvis_intents.match(text, INTENTS)
+    if not hits:
+        return None
+    P = CFG["phrases"]
+    if jarvis_intents.is_tie(hits):
+        opts = jarvis_intents.tie_options(hits)
+        labels = [INTENT_LABELS.get(o, o) for o in opts]
+        STATE.pending_clarify = (opts, text)
+        notify(f"Ты имел в виду: {' или '.join(labels)}? Скажи «первая» или «вторая».", ok=False)
+        return "clarified"
+    hit = hits[0]
+    run = _INTENT_RUNS.get(hit.intent.name)
+    if run is None:
+        return None
+    if hit.intent.play_only and not STATE.playing:
+        notify(f"Сейчас учебный режим. Скажи «{P['play_mode']}».", ok=False)
+        return "clarified"
+    run(text)
+    jarvis_history.DISPATCH.set(*(STATE.history_custom or ("команда", text, "выполнена")))
+    return "clarified"
+
+
 # Одиночные команды (состояние, выход, питание): в цепочках не участвуют —
 # «выключи пк и открой стим» выполнит только выключение, остальное проигнорирует.
 _SINGLE_RUNS = (cmd_exit, cmd_cancel_shutdown, cmd_shutdown, cmd_restart, cmd_voice, cmd_forget)
@@ -3200,6 +3356,17 @@ def process(text: str, refined: bool = False) -> None:
 
 def _process_inner(text: str, refined: bool = False) -> None:
     P = CFG["phrases"]
+    if STATE.pending_clarify:
+        opts, original = STATE.pending_clarify
+        idx = jarvis_intents.clarify_choice(text, len(opts))
+        STATE.pending_clarify = None
+        if idx is not None and idx < len(opts):
+            run = _INTENT_RUNS.get(opts[idx])
+            if run:
+                run(original)
+                jarvis_history.DISPATCH.set(*(STATE.history_custom or ("команда", original, "выполнена")))
+                return
+        # не разобрали ответ — обрабатываем как обычную фразу
     if STATE.pending_confirm:
         _process_confirmation(text)
         return
@@ -3285,6 +3452,9 @@ def _process_inner(text: str, refined: bool = False) -> None:
             if cmd.run is cmd_dictate and cmd.match(text):
                 cmd.run(text)
                 return
+    # Декларативный реестр интентов: приоритетная таблица с переспросом при ничьей.
+    if _registry_match(text) is not None:
+        return
     if ask and jarvis_ai.is_question(ask) and not is_help(ask) and not _local_first:
         ask_ai(ask)
         return
