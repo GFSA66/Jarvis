@@ -35,6 +35,7 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 import jarvis_routing
+import jarvis_history
 
 
 _STARTUP_DATA_DIR = Path(os.environ.get("JARVIS_HOME") or (Path.home() / ".jarvis"))
@@ -989,6 +990,7 @@ class State:
         self.dictation_last_chunk = ""
         self.pending_confirm: dict | None = None
         self.last_close_pids: list = []  # pid'ы для принудительного закрытия после подтверждения
+        self.history_custom: tuple | None = None  # своя запись истории от текущей команды
 
 
 STATE = State()
@@ -1900,7 +1902,8 @@ def cmd_dictate(t):
     try:
         js.type_text(typed, str(dc.get("method", "auto")), int(dc.get("char_delay_ms", 8)),
                      callback=lambda e: notify("Вставил текст." if not e else f"Не получилось: {e}", ok=not bool(e)))
-        history_add("диктовка", f"диктовка, {len(typed)} символов", "введено")
+        # одна запись на фразу — через диспетчер (см. process)
+        STATE.history_custom = ("диктовка", f"диктовка, {len(typed)} символов", "введено")
     except Exception as e:
         log_error("Диктовка", e)
         notify("Не удалось вставить текст.", ok=False)
@@ -2003,6 +2006,7 @@ def history_text(limit: int = 20) -> str:
 
 
 def cmd_history(t):
+    STATE.history_custom = ("команда", t, "история запросов")
     if is_word(t, "очисти", "очистить", "удали", "удалить", "сбрось"):
         try:
             HISTORY_PATH.unlink(missing_ok=True)
@@ -2136,7 +2140,9 @@ def reminders_text() -> str:
 def _fire_reminder(text: str) -> None:
     print(f"[напоминание] {text}")
     notify(f"Напоминание: {text}", force_speak=True)
-    history_add("напоминание", "напоминание", text)
+    # Отдельное событие (сработал таймер, а не голосовая фраза): пишем сразу,
+    # с текстом напоминания и временем — не заглушку «напоминание».
+    history_add("напоминание", text, f"сработало в {time.strftime('%H:%M')}")
 
 
 def reminders_loop() -> None:
@@ -2187,6 +2193,7 @@ def reminders_loop() -> None:
 
 
 def cmd_reminders(t):
+    STATE.history_custom = ("команда", t, "напоминания показаны")
     if is_word(t, "удали", "удалить", "очисти", "очистить", "сбрось", "отмени", "отменить", "убери"):
         reminders_save([])
         notify("Все напоминания удалены.")
@@ -2212,7 +2219,8 @@ def cmd_remind(t):
     reminder_add(text, at, daily)
     when = f"каждый день в {at}" if daily else at
     notify(f"Хорошо, напомню: {text} — {when}.")
-    history_add("напоминание", t, f"поставлено: {text} ({when})")
+    # одна запись на фразу — через диспетчер (см. process)
+    STATE.history_custom = ("напоминание", t, f"поставлено: {text} ({when})")
 
 
 def show_text(name: str, text: str) -> None:
@@ -3016,7 +3024,8 @@ def _dictation_feed(text: str) -> None:
         STATE.dictation_last_chunk = typed
         js.type_text(typed, str(dc.get("method", "auto")), int(dc.get("char_delay_ms", 8)),
                      callback=lambda e: notify(f"Не получилось: {e}", ok=False) if e else None)
-    history_add("диктовка", f"диктовка, {len(typed)} символов", "введено")
+        # одна запись на фразу — через диспетчер (см. process)
+        STATE.history_custom = ("диктовка", f"диктовка, {len(typed)} символов", "введено")
 
 
 def U(key):  # ссылка из config.urls
@@ -3165,13 +3174,31 @@ def _chain_run(parts: list, addressed: bool) -> bool:
             notify(f"Сейчас учебный режим. Скажи «{P['play_mode']}».", ok=False)
             continue
         cmd.run(trial)
-        # самим командам журналировать себя важнее (в них уже есть свой ответ)
-        if addressed and cmd.run not in (cmd_history, cmd_remind, cmd_reminders):
-            history_add("команда", trial, "выполнена")
+        # запись в историю — одной строкой в конце запроса (см. process)
     return True
 
 
+def _flush_history() -> None:
+    """Единственная точка записи истории команд: одна фраза — одна запись."""
+    entry = jarvis_history.DISPATCH.take()
+    if entry:
+        history_add(*entry)
+
+
 def process(text: str, refined: bool = False) -> None:
+    """Диспетчер: дедуп повторов, фильтры мусора, одна запись истории на запрос."""
+    if not jarvis_history.DISPATCH.begin(text):
+        return  # повторный захват того же аудио в пределах 3 с — уже выполнено
+    if jarvis_history.is_hallucination(text):
+        return  # галлюцинация STT («продолжение следует») — молча
+    STATE.history_custom = None
+    try:
+        _process_inner(text, refined)
+    finally:
+        _flush_history()
+
+
+def _process_inner(text: str, refined: bool = False) -> None:
     P = CFG["phrases"]
     if STATE.pending_confirm:
         _process_confirmation(text)
@@ -3209,7 +3236,7 @@ def process(text: str, refined: bool = False) -> None:
         {"shutdown": cmd_shutdown, "restart": cmd_restart,
          "cancel": cmd_cancel_shutdown, "sleep": cmd_power,
          "hibernate": cmd_power, "lock": cmd_power}[power](text)
-        history_add("команда", text, "выполнена")
+        jarvis_history.DISPATCH.set("команда", text, "выполнена")
         return
 
     # Обращение к Джарвису: слово-активатор уже проверено выше, иначе ищем имя в фразе.
@@ -3217,6 +3244,10 @@ def process(text: str, refined: bool = False) -> None:
     named = any(n in text for n in CFG["ai"]["names"])
     attentive = time.time() < STATE.attention_until
     addressed = bool(wake["enabled"]) or named or attentive
+    # В окне внимания филлеры/обрывки («ну», «давай», «ага») не выполняются
+    # и не отправляются в нейросеть — молча.
+    if addressed and jarvis_history.is_filler(text):
+        return
     if addressed and ai_ready():
         window = (CFG["ai"].get("chat") or {}).get("attention_sec", 25)
         STATE.attention_until = time.time() + max(0.0, window)
@@ -3241,6 +3272,7 @@ def process(text: str, refined: bool = False) -> None:
     if not any(k in text for k in (P["pause"], P["study_mode"], P["play_mode"])):
         parts = split_chain(text)
         if len(parts) > 1 and _chain_run(parts, addressed):
+            jarvis_history.DISPATCH.set("команда", text, "выполнена")
             return
 
     # вопрос («какая погода», «что поиграть») — сразу нейросети, а не по списку команд.
@@ -3263,9 +3295,8 @@ def process(text: str, refined: bool = False) -> None:
                 notify(f"Сейчас учебный режим. Скажи «{P['play_mode']}».", ok=False)
             else:
                 cmd.run(text)
-                # самим командам журналировать себя важнее (в них уже есть свой ответ)
-                if addressed and cmd.run not in (cmd_history, cmd_remind, cmd_reminders, cmd_dictate):
-                    history_add("команда", text, "выполнена")
+                # одна запись на фразу: своя от команды (диктовка/напоминание) либо «выполнена»
+                jarvis_history.DISPATCH.set(*(STATE.history_custom or ("команда", text, "выполнена")))
             return
 
     # Локально ничего не понято: вопрос-рекомендация («во что поиграть, только не
@@ -3287,8 +3318,15 @@ def process(text: str, refined: bool = False) -> None:
 
     if ask:  # обратились по имени, но это не команда — пусть ответит нейросеть
         ask_ai(ask)
-    elif addressed and jarvis_ai and not CFG["ai"]["enabled"] and jarvis_ai.is_question(ai_question(text)):
+        return
+    if addressed and jarvis_ai and not CFG["ai"]["enabled"] and jarvis_ai.is_question(ai_question(text)):
         notify("Нейросеть выключена. Включи её в настройках, вкладка «Нейросеть», и нажми «Сохранить».", ok=False)
+        return
+    # Ничего не понято: короткий отклик вместо молчания и одна запись «не понял».
+    # Болтовню рядом (не addressed и не похоже на команду) игнорируем без отклика.
+    if addressed or _looks_like_command(text):
+        notify("Не понял, повтори.", ok=False)
+        jarvis_history.DISPATCH.set("команда", text, "не понял")
 
 
 # ============================================================================
