@@ -30,29 +30,9 @@
     "confirm_unknown": false,
     "indicator": true
   },
-  "stt": {
-    "engine": "vosk",
-    "model": "small",
-    "whisper_model": "small",
-    "confidence_min": 0.35,
-    "models_dir": "",
-    "prebuffer_ms": 400,
-    "vad_energy_margin": 2.0,
-    "echo_tail_ms": 400
-  },
   "system": {
     "app_aliases": {"хром": "chrome.exe", "блокнот": "notepad.exe"},
     "sound_devices": {"наушники": "Headphones", "колонки": "Speakers"}
-  },
-  "stt": {
-    "engine": "vosk",
-    "model": "small",
-    "whisper_model": "small",
-    "confidence_min": 0.35,
-    "models_dir": "",
-    "prebuffer_ms": 400,
-    "vad_energy_margin": 2.0,
-    "echo_tail_ms": 400
   },
   "integrations": {
     "weather_city": "",
