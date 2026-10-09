@@ -57,7 +57,7 @@ def power_intent(text: str) -> str | None:
         return "restart"
     if has(t, "выключ", "выруб", "заверш") and (is_pc_target(t) or has(t, "работ")):
         return "shutdown"
-    if has(t, "режим сна") or re.search(r"\bусни\b|\bспи\b", t):
+    if has(t, "режим сна") or has(t, "спящ", "сон") or re.search(r"\bусни\b|\bспи\b|\bусып\w*", t):
         return "sleep"
     if has(t, "гибернац"):
         return "hibernate"
@@ -112,12 +112,17 @@ def has_negation(text: str) -> bool:
 
 
 def is_recommendation(text: str) -> bool:
-    """Фраза-просьба посоветовать: её нельзя резать и по ней нельзя запускать игры."""
+    """Фраза-просьба посоветовать: её нельзя резать и по ней нельзя запускать игры.
+
+    Вопрос по первому слову («что…», «как…») считается только от 3 слов —
+    иначе одиночные филлеры («как», «как бы», «что») уходили бы в нейросеть.
+    """
     t = normalize(text)
     if any(w in t for w in ("посоветуй", "посоветуешь", "рекоменд", "предложи игру",
                             "что поиграть", "во что", "какую игру", "что лучше поиграть")):
         return True
-    return bool(t) and t.split()[0] in _QUESTION_STARTS
+    words = t.split()
+    return bool(words) and len(words) >= 3 and words[0] in _QUESTION_STARTS
 
 
 def negated_terms(text: str, terms) -> set[str]:

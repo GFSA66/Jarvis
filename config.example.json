@@ -30,10 +30,6 @@
     "confirm_unknown": false,
     "indicator": true
   },
-  "system": {
-    "app_aliases": {"хром": "chrome.exe", "блокнот": "notepad.exe"},
-    "sound_devices": {"наушники": "Headphones", "колонки": "Speakers"}
-  },
   "stt": {
     "engine": "vosk",
     "model": "small",
@@ -43,6 +39,10 @@
     "prebuffer_ms": 400,
     "vad_energy_margin": 2.0,
     "echo_tail_ms": 400
+  },
+  "system": {
+    "app_aliases": {"хром": "chrome.exe", "блокнот": "notepad.exe"},
+    "sound_devices": {"наушники": "Headphones", "колонки": "Speakers"}
   },
   "stt": {
     "engine": "vosk",

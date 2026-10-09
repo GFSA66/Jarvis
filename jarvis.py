@@ -384,6 +384,10 @@ def reload_config() -> None:
               find_genshin, find_minecraft, find_prism):
         f.cache_clear()
     STATE.voice_enabled = bool(CFG["voice"]["enabled"])
+    # Сброс кеша STT: смена движка/порога/модели применяется без перезапуска.
+    # Следующий вызов stt_engine() создаст движок с новыми параметрами.
+    global STT_ENGINE
+    STT_ENGINE = None
     if HOTKEY and js:
         try:
             HOTKEY.start(CFG.get("integrations", {}).get("hotkey", "ctrl+alt+j"))

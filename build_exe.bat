@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 cd /d "%~dp0"
 
 rem Pick a tested Python (3.13 -> 3.10). The newest (3.14) often has no wheels for PyAudioWPatch/pywin32.
@@ -30,9 +30,10 @@ if not exist "jarvis.ico" echo [Jarvis] jarvis.ico not found - building with the
     %ICON_ARGS% ^
     --collect-all customtkinter ^
     --collect-all speech_recognition ^
-    --collect-all piper ^
     --collect-all vosk ^
     --collect-all faster_whisper ^
+    --collect-all ctranslate2 ^
+    --collect-all piper ^
     --collect-data ytmusicapi ^
     --collect-data jarvis_settings ^
     --collect-data jarvis_utils ^
@@ -43,6 +44,10 @@ if not exist "jarvis.ico" echo [Jarvis] jarvis.ico not found - building with the
     --hidden-import pyttsx3.drivers ^
     --hidden-import pyttsx3.drivers.sapi5 ^
     --hidden-import onnxruntime ^
+    --hidden-import faster_whisper ^
+    --hidden-import ctranslate2 ^
+    --hidden-import numpy ^
+    --hidden-import av ^
     --hidden-import win32timezone ^
     --hidden-import pycaw ^
     --hidden-import comtypes ^

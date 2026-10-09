@@ -1,3 +1,4 @@
+# --- ядро -------------------------------------------------------------------
 SpeechRecognition>=3.10
 PyAudioWPatch
 pyttsx3
@@ -11,11 +12,17 @@ psutil
 screen-brightness-control
 comtypes
 keyring
-numpy
-# --- Распознавание речи (STT). Основной режим офлайн на vosk, модель качается
-# при первом запуске в ~/.jarvis/models. Whisper (faster-whisper) — для диктовки.
-# Google (recognize_google) остаётся запасным и уже покрыт SpeechRecognition.
-vosk
-faster-whisper
-# Необязательно: чтение уведомлений Windows — pip install winsdk
 requests
+
+# --- распознавание речи (STT). Основной движок — офлайн vosk (по умолчанию). ---
+# Vosk: быстрый офлайн-движок с грамматикой команд. Модель НЕ тянется pip и
+# не вшивается в exe — она качается при первом запуске в ~/.jarvis/models
+# (см. jarvis_stt.VOSK_MODELS).
+vosk>=0.3.45
+# faster-whisper: офлайн-диктовка и длинные фразы (движки whisper/гибрид).
+# Тянет onnxruntime/ctranslate2; на слабых ПК можно не ставить — хватит vosk.
+faster-whisper>=1.0
+# Google (recognize_google) — запасной онлайн-движок, покрыт SpeechRecognition выше.
+
+# --- Необязательно: чтение уведомлений Windows ---
+# pip install winsdk
