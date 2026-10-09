@@ -27,6 +27,9 @@ def _fake_vosk_module(payload):
             def SetWords(self, flag):
                 pass
 
+            def Reset(self):
+                pass
+
             def AcceptWaveform(self, pcm):
                 pass
 
@@ -66,6 +69,55 @@ def test_vosk_text_without_word_conf_defaults(monkeypatch):
     assert conf == 0.7, conf
 
 
+def test_vosk_recognizer_reused_between_phrases(monkeypatch):
+    """Recognizer переиспользуется между фразами: Kaldi строит грамматику один раз.
+
+    Иначе на каждую фразу он заново строит FST и сыплет «Ignoring word missing
+    in vocabulary» на каждое слово списка — консоль заваливается warning'ами.
+    """
+    import sys  # noqa: PLC0415
+    created = []
+    resets = []
+
+    class Mod:
+        @staticmethod
+        def SetLogLevel(level):
+            pass
+
+        class Model:
+            def __init__(self, path):
+                pass
+
+        class Rec:
+            def __init__(self, model, rate, grammar=""):
+                created.append(rate)
+
+            def SetWords(self, flag):
+                pass
+
+            def Reset(self):
+                resets.append(1)
+
+            def AcceptWaveform(self, pcm):
+                pass
+
+            def FinalResult(self):
+                return '{"text": "привет", "result": []}'
+
+        SetLogLevel = SetLogLevel
+        Model = Model
+        KaldiRecognizer = Rec
+
+    monkeypatch.setattr(stt, "ensure_vosk_model", lambda model, cfg: "x")
+    monkeypatch.setitem(sys.modules, "vosk", Mod)
+    backend = stt.VoskBackend({"model": "small"}, grammar=["привет"])
+    for _ in range(3):
+        assert backend.transcribe(b"", 16000) == ("привет", 0.7)
+    # три фразы — один созданный recognizer, но три сброса состояния
+    assert created == [16000]
+    assert len(resets) == 3
+
+
 def test_defaults_merge_for_old_config():
     eng = stt.STTEngine({})  # старый config.json без секции «stt»
     assert eng.cfg["engine"] == "vosk"
@@ -73,9 +125,10 @@ def test_defaults_merge_for_old_config():
 
 
 def test_build_grammar_filters_garbage():
-    words = ["Открой", "стим", "a", "12", "блокнот", "блокнот", "hi-fi", "юTube!"]
+    words = ["Открой", "стим", "a", "12", "блокнот", "блокнот", "hi-fi", "юTube!",
+             "bяркость", "bнапомни"]
     gram = stt.build_grammar(words)
-    # дедуп, без мусора (короткие/с посторонними символами отбрасываются)
+    # дедуп, без мусора (короткие/посторонние символы/смесь латиницы и кириллицы)
     assert gram == ["открой", "стим", "блокнот", "hi-fi"]
 
 

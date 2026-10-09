@@ -13,9 +13,11 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
+import sys
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -117,6 +119,40 @@ def _download(url: str, dest: Path, log=None) -> None:
 #  Бэкенды (все импорты ленивые)
 # ---------------------------------------------------------------------------
 
+@contextlib.contextmanager
+def _quiet_vosk():
+    """Подавить C++-предупреждения Vosk («missing in vocabulary») на Windows.
+
+    ``vosk.SetLogLevel(-1)`` НЕ глушит эти строки: Kaldi пишет их напрямую
+    в файловый дескриптор 2, минуя Python. Перенаправляем fd 2 в nul на время
+    вызова и возвращаем обратно, чтобы остальные ошибки были видны.
+    """
+    if os.name != "nt":  # не Windows — дублировать нечего, Kaldi там тихий
+        yield
+        return
+    try:
+        sys.stderr.flush()
+    except (ValueError, OSError):
+        pass
+    try:
+        saved_fd = os.dup(2)
+        nul = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(nul, 2)
+    except OSError:  # не удалось перенаправить — просто работаем как обычно
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            sys.stderr.flush()
+        except (ValueError, OSError):
+            pass
+        os.dup2(saved_fd, 2)  # вернуть настоящий stderr
+        os.close(saved_fd)
+        os.close(nul)
+
+
 class VoskBackend:
     """Офлайн Kaldi через vosk; с grammar — высокая точность на коротких командах."""
 
@@ -133,19 +169,38 @@ class VoskBackend:
         self._use_grammar = use_grammar
         path = ensure_vosk_model(str(cfg.get("model") or "small"), cfg)
         self._model = vosk.Model(str(path))
+        self._recs: dict[int, object] = {}  # recognizer переиспользуется по частоте
+
+    def _recognizer(self, rate: int):
+        """Recognizer создаётся один раз на частоту и переиспользуется между фразами.
+
+        Раньше он пересобирался каждую фразу: Kaldi заново строил грамматику и
+        сыпал «Ignoring word missing in vocabulary» на каждое слово из списка.
+        Между фразами делаем Reset(). Создание оборачиваем в _quiet_vosk —
+        эти строки пишет C++ Kaldi напрямую в fd 2, минуя Python.
+        """
+        rec = self._recs.get(rate)
+        if rec is None:
+            gram = ""
+            if self._use_grammar and self._grammar:
+                # грамматика: известные слова команд + [unk] для незнакомых (диктовка)
+                gram = json.dumps(self._grammar + ["[unk]"], ensure_ascii=False)
+            with _quiet_vosk():
+                rec = self._vosk.KaldiRecognizer(self._model, rate, gram) if gram \
+                    else self._vosk.KaldiRecognizer(self._model, rate)
+                rec.SetWords(True)  # без этого FinalResult не отдаёт conf по словам
+            self._recs[rate] = rec
+        rec.Reset()  # чистим состояние прошлой фразы перед новой
+        return rec
 
     def transcribe(self, pcm: bytes, rate: int) -> tuple[str, float]:
-        gram = ""
-        if self._use_grammar and self._grammar:
-            # грамматика: известные слова команд + [unk] для незнакомых (диктовка)
-            gram = json.dumps(self._grammar + ["[unk]"], ensure_ascii=False)
-        rec = self._vosk.KaldiRecognizer(self._model, rate, gram) if gram \
-            else self._vosk.KaldiRecognizer(self._model, rate)
-        rec.SetWords(True)  # без этого FinalResult не отдаёт conf по словам
-        rec.AcceptWaveform(bytes(pcm))
+        rec = self._recognizer(rate)
+        with _quiet_vosk():  # AcceptWaveform/FinalResult тоже могут писать в C++-stderr
+            rec.AcceptWaveform(bytes(pcm))
+            raw = rec.FinalResult()
         try:
-            data = json.loads(rec.FinalResult())
-        except json.JSONDecodeError:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
             return "", 0.0
         text = str(data.get("text") or "").strip()
         # Верхнеуровневого confidence в FinalResult нет — берём среднее conf слов.
@@ -341,6 +396,9 @@ def build_grammar(words) -> list[str]:
             continue
         if not re.search(r"[a-zа-я]", w):
             continue  # чисто цифры — не слова грамматики
+        # смесь латиницы и кириллицы («bяркость» из \b в regex паттерна) — мусор
+        if re.search(r"[a-z]", w) and re.search(r"[а-я]", w):
+            continue
         if w not in seen:
             seen.add(w)
             out.append(w)
