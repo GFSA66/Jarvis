@@ -32,6 +32,9 @@ DEFAULTS = {
     "prebuffer_ms": 400,         # предзапись до начала речи (не режет первое слово)
     "vad_energy_margin": 2.0,    # во сколько раз энергия речи выше тишины
     "echo_tail_ms": 400,         # пауза после речи Джарвиса (подавление эха)
+    "grammar": False,            # жёсткая FST-грамматика Vosk. False = свободное
+                                 # распознавание (многословные команды не режутся);
+                                 # True — только для шумного фона/коротких команд.
 }
 
 VOSK_MODELS = {
@@ -295,8 +298,11 @@ class STTEngine:
 
     def _backend(self, name: str):
         if name not in self._backends:
+            # grammar из настроек: по умолчанию свободное распознавание, чтобы
+            # многословные команды не обрубались жёстким списком слов.
+            use_grammar = bool(self.cfg.get("grammar", False))
             if name == "vosk":
-                self._backends[name] = VoskBackend(self.cfg, self.grammar, use_grammar=True)
+                self._backends[name] = VoskBackend(self.cfg, self.grammar, use_grammar=use_grammar)
             elif name == "vosk_plain":
                 self._backends[name] = VoskBackend(self.cfg, self.grammar, use_grammar=False)
             elif name == "whisper":
@@ -307,19 +313,37 @@ class STTEngine:
                 raise STTError(f"Неизвестный STT-движок: {name}")
         return self._backends[name]
 
+    def _chain(self) -> list[str]:
+        """Цепочка бэкендов. В конфиге оставлен неизвестный/битый движок —
+        молча откатываемся на дефолт (vosk), чтобы не уронить распознавание."""
+        engine = str(self.cfg.get("engine") or "vosk")
+        known = {"vosk": ["vosk"], "whisper": ["whisper"], "google": ["google"],
+                 "hybrid": ["vosk", "vosk_plain", "google"]}
+        chain = known.get(engine)
+        if chain is None:
+            chain = known["vosk"]
+        # страховка: выбранный движок недоступен (нет пакета/модели/сети) —
+        # добавляем запасные, чтобы «недоступно» не превращалось в тишину.
+        for fb in ("vosk", "google"):
+            if fb not in chain:
+                chain = chain + [fb]
+        return chain
+
     def transcribe(self, pcm: bytes, rate: int) -> STTResult:
         engine = str(self.cfg.get("engine") or "vosk")
-        chain = {"vosk": ["vosk"], "whisper": ["whisper"], "google": ["google"],
-                 "hybrid": ["vosk", "vosk_plain", "google"]}.get(engine, ["vosk"])
+        chain = self._chain()
         text, conf, used, last_err = "", 0.0, chain[0], None
         for name in chain:
             try:
                 text, conf = self._backend(name).transcribe(pcm, rate)
             except STTError as e:
                 last_err = e
-                continue
+                continue  # движок недоступен (нет пакета/модели/сети) — пробуем следующий
             used = name
-            if text and conf >= self.confidence_min():
+            # Уходим на запасной движок по причине «недоступен», но НЕ по низкой
+            # уверенности: иначе офлайн-vosk тихо сливал бы звук в онлайн-Google.
+            # Исключение — hybrid, где повторный проход по уверенности и задуман.
+            if engine != "hybrid" or (text and conf >= self.confidence_min()):
                 break
         if not text and last_err:
             raise last_err
