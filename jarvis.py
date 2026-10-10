@@ -3555,10 +3555,11 @@ def _process_inner(text: str, refined: bool = False) -> None:
 # ============================================================================
 
 recognizer = sr.Recognizer()
-audio_q: queue.Queue = queue.Queue(maxsize=5)
-STT_DEBUG = False  # включается флагом --stt-debug
+audio_q: queue.Queue = queue.Queue(maxsize=20)  # запас под всплески: при переполнении
+STT_DEBUG = False  # включается флагом --stt-debug                       # пишем в лог и сигналим, а не молчим
 STT_DEBUG_LOG = DATA_DIR / "stt_debug.log"
 STT_ENGINE: jarvis_stt.STTEngine | None = None  # создаётся лениво (скачивание модели)
+STT_QUEUE_DROPS = 0  # счётчик потерянных сегментов (диагностика переполнения)
 
 
 def _stt_debug(line: str) -> None:

@@ -31,10 +31,16 @@ DEFAULTS = {
     "models_dir": "",            # пусто → ~/.jarvis/models
     "prebuffer_ms": 400,         # предзапись до начала речи (не режет первое слово)
     "vad_energy_margin": 2.0,    # во сколько раз энергия речи выше тишины
+    "vad_silence_ms": 900,       # тишина для конца фразы (держит паузы внутри команды)
+    "vad_min_rms": 120.0,        # пол порога VAD: тихая речь не теряется
     "echo_tail_ms": 400,         # пауза после речи Джарвиса (подавление эха)
     "grammar": False,            # жёсткая FST-грамматика Vosk. False = свободное
                                  # распознавание (многословные команды не режутся);
                                  # True — только для шумного фона/коротких команд.
+    "debug_samples": False,      # сохранять последние WAV в ~/.jarvis/stt_samples/
+    "debug_samples_max": 50,     # ротация сэмплов
+    "barge_in": False,           # речь поверх TTS прерывает озвучку (по умолчанию
+                                 # выкл: без эхоподавления даёт ложные срабатывания)
 }
 
 VOSK_MODELS = {
@@ -118,6 +124,68 @@ def _download(url: str, dest: Path, log=None) -> None:
                     log(f"Скачиваю модель: {100 * done // total}%")
 
 
+def resample_pcm(pcm: bytes, src_rate: int, dst_rate: int = 16000) -> bytes:
+    """Передискретизация 16-бит моно PCM в dst_rate (чистый Python, без numpy).
+
+    Линейная интерполяция — достаточно для речи/Vosk. Нужна, если микрофон
+    отдал не 16 кГц: без неё слова той же длительности звучат «быстрее» и
+    Vosk возвращает мусор (замер: 44.1 кГц как 16 кГц → «ваш что»).
+    Одинаковые частоты — возврат как есть (без копии лишних данных).
+    """
+    if not pcm or int(src_rate) == int(dst_rate):
+        return pcm
+    import array
+    src = array.array("h", bytes(pcm))
+    n_src = len(src)
+    if n_src < 2:
+        return pcm
+    n_dst = max(1, int(round(n_src * dst_rate / src_rate)))
+    dst = array.array("h", [0]) * n_dst
+    step = n_src / n_dst
+    for i in range(n_dst):
+        pos = i * step
+        j = int(pos)
+        frac = pos - j
+        a = src[j]
+        b = src[j + 1] if j + 1 < n_src else a
+        dst[i] = int(a + (b - a) * frac)
+    return dst.tobytes()
+
+
+def save_debug_sample(pcm: bytes, rate: int, cfg: dict | None = None,
+                      tag: str = "seg") -> str:
+    """Сохранить WAV в ~/.jarvis/stt_samples/ с ротацией (по умолчанию выкл).
+
+    Возвращает путь к файлу или «» (выключено/ошибка). Файлы нужны, чтобы
+    владелец прислал запись, на которой распознавание ошиблось, и её можно
+    было прогнать через tools/eval_stt.py как регрессионный тест.
+    """
+    try:
+        cfg = cfg or {}
+        if not cfg.get("debug_samples"):
+            return ""
+        root = Path.home() / ".jarvis" / "stt_samples"
+        root.mkdir(parents=True, exist_ok=True)
+        limit = max(1, int(cfg.get("debug_samples_max") or 50))
+        import time as _t
+        import wave as _w
+        name = f"{_t.strftime('%Y%m%d-%H%M%S')}-{tag}-{int(_t.time() * 1000) % 100000}.wav"
+        with _w.open(str(root / name), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(int(rate))
+            w.writeframes(bytes(pcm))
+        files = sorted(root.glob("*.wav"), key=lambda p: p.stat().st_mtime)
+        for old in files[:-limit]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        return str(root / name)
+    except (OSError, ValueError):
+        return ""
+
+
 # ---------------------------------------------------------------------------
 #  Бэкенды (все импорты ленивые)
 # ---------------------------------------------------------------------------
@@ -197,9 +265,10 @@ class VoskBackend:
         return rec
 
     def transcribe(self, pcm: bytes, rate: int) -> tuple[str, float]:
-        rec = self._recognizer(rate)
+        pcm16 = resample_pcm(bytes(pcm), rate, 16000)
+        rec = self._recognizer(16000)
         with _quiet_vosk():  # AcceptWaveform/FinalResult тоже могут писать в C++-stderr
-            rec.AcceptWaveform(bytes(pcm))
+            rec.AcceptWaveform(pcm16)
             raw = rec.FinalResult()
         try:
             data = json.loads(raw)
@@ -235,7 +304,8 @@ class WhisperBackend:
 
     def transcribe(self, pcm: bytes, rate: int) -> tuple[str, float]:
         import numpy as np  # noqa: PLC0415
-        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        pcm16 = resample_pcm(bytes(pcm), rate, 16000)
+        audio = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
         segments, _info = self._model.transcribe(
             audio, language="ru", beam_size=1, vad_filter=True,
             initial_prompt=self._prompt or None)
@@ -365,12 +435,19 @@ class StreamVAD:
 
     feed(rms) → «speech» | «silence» | None; порог = шум × margin,
     порог адаптируется к фоновому шуму во время пауз.
+
+    silence_frames можно задать напрямую (старые тесты) либо через
+    silence_ms + frame_ms: конец фразы после silence_ms тишины. Дефолт
+    900 мс — держит паузы 300–500 мс внутри многословных команд.
     """
 
-    def __init__(self, margin: float = 2.0, min_rms: float = 300.0,
-                 silence_frames: int = 12, min_speech_frames: int = 3):
+    def __init__(self, margin: float = 2.0, min_rms: float = 120.0,
+                 silence_frames: int | None = None, min_speech_frames: int = 3,
+                 silence_ms: float = 900.0, frame_ms: float = 30.0):
         self.margin = margin
         self.min_rms = min_rms
+        if silence_frames is None:
+            silence_frames = max(1, int(round(silence_ms / max(1.0, frame_ms))))
         self.silence_frames = silence_frames
         self.min_speech_frames = min_speech_frames
         self._noise = min_rms          # адаптивная оценка тишины

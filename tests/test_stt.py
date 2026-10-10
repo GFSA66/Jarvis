@@ -282,3 +282,101 @@ def test_engine_vosk_grammar_on_when_enabled(monkeypatch):
     monkeypatch.setattr(stt, "VoskBackend", fake_vosk)
     eng.transcribe(b"\x00" * 100, 16000)
     assert seen.get("use_grammar") is True
+
+
+# ---------------------------------------------------------------------------
+# Доп. задача №2: ресемплинг, VAD по миллисекундам, WAV-сэмплы
+# ---------------------------------------------------------------------------
+
+
+def _sine_pcm(rate: int, seconds: float, freq: float = 440.0, amp: int = 5000) -> bytes:
+    import array
+    import math
+    n = int(rate * seconds)
+    a = array.array("h", [0]) * n
+    for i in range(n):
+        a[i] = int(amp * math.sin(2 * math.pi * freq * i / rate))
+    return a.tobytes()
+
+
+def test_resample_same_rate_returns_as_is():
+    pcm = _sine_pcm(16000, 0.1)
+    assert stt.resample_pcm(pcm, 16000, 16000) == pcm
+    assert stt.resample_pcm(b"", 44100, 16000) == b""
+
+
+def test_resample_44100_to_16000_keeps_duration():
+    """44.1 кГц → 16 кГц: длина кадра меняется пропорционально частоте.
+
+    Без этого Vosk получал «ускоренную» речь и возвращал мусор («ваш что»
+    вместо полной фразы mic_test.wav).
+    """
+    pcm = _sine_pcm(44100, 1.0)
+    out = stt.resample_pcm(pcm, 44100, 16000)
+    assert len(out) == 16000 * 2  # 1 с × 16 кГц × 2 байта
+    import array
+    a = array.array("h", out)
+    assert max(abs(x) for x in a) > 1000  # сигнал не затух
+
+
+def test_vad_default_silence_is_900ms():
+    """Конец фразы по умолчанию после 900 мс тишины, а не 0.4 с.
+
+    Паузы 300–500 мс внутри «открой … стим» больше не рвут фразу.
+    """
+    vad = stt.StreamVAD(margin=2.0, min_rms=120.0)
+    assert vad.silence_frames == 30  # 900 мс / 30 мс на чанк
+    for _ in range(5):
+        vad.feed(20.0)
+    # старт требует min_speech_frames=3 чанка подряд
+    assert vad.feed(3000.0) is None
+    assert vad.feed(3000.0) is None
+    assert vad.feed(3000.0) == "speech"
+    # 0.5 с тишины (16 чанков) — фраза ещё жива
+    mid = None
+    for _ in range(16):
+        mid = vad.feed(20.0)
+    assert mid is None
+    # после 900 мс — конец
+    end = None
+    for _ in range(20):
+        end = vad.feed(20.0)
+    assert end == "silence"
+
+
+def test_vad_quiet_voice_starts_below_old_floor():
+    """Тихая речь не теряется: при фоне ~20 порог = max(120, 20×2) = 120.
+
+    Замер mic_test.wav: фон RMS ~10–40, затухание к концу фразы ~400–500.
+    Старый пол 300 резал бы тихое начало/конец; новый 120 — нет.
+    """
+    vad = stt.StreamVAD(margin=2.0, min_rms=120.0, silence_frames=5,
+                        min_speech_frames=2)
+    for _ in range(30):  # тихая комната — шум адаптируется к ~20
+        vad.feed(20.0)
+    assert vad.threshold == 120.0
+    assert vad.feed(150.0) is None
+    assert vad.feed(150.0) == "speech"  # тихая речь стартует
+    old = stt.StreamVAD(margin=2.0, min_rms=300.0, silence_frames=5,
+                        min_speech_frames=2)
+    for _ in range(30):
+        old.feed(20.0)
+    assert old.threshold == 300.0
+    # при тех же условиях старый пол считал бы тихую речь тишиной
+    assert old.feed(150.0) == "silence"
+
+
+def test_save_debug_sample_off_by_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(stt.Path, "home", lambda: tmp_path)
+    assert stt.save_debug_sample(b"\x00" * 100, 16000, {}) == ""
+
+
+def test_save_debug_sample_rotation(tmp_path, monkeypatch):
+    monkeypatch.setattr(stt.Path, "home", lambda: tmp_path)
+    cfg = {"debug_samples": True, "debug_samples_max": 3}
+    for i in range(5):
+        p = stt.save_debug_sample(_sine_pcm(16000, 0.05), 16000, cfg, tag=f"t{i}")
+        assert p
+    left = list((tmp_path / ".jarvis" / "stt_samples").glob("*.wav"))
+    assert len(left) == 3
+
