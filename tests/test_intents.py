@@ -218,6 +218,64 @@ def test_power_matrix_full():
         assert routing.power_intent(phrase) == expected, phrase
 
 
+# --- нечёткий активатор и нормализация слотов (доп. задачи №3–№4) ----------
+
+WAKE_CASES = [
+    ("джарвис закрой стим", True, "закрой стим"),
+    ("джервис закрой стим", True, "закрой стим"),
+    ("джарвес открой стим", True, "открой стим"),
+    ("жарвис запусти стем", True, "запусти стем"),
+    ("дарвис закрой тим", True, "закрой тим"),
+    ("чарвис закрой ским", True, "закрой ским"),
+    ("джарви закрой стим", True, "закрой стим"),
+    ("джерри закрой ским", True, "закрой ским"),
+    ("джерси закрой стим", True, "закрой стим"),
+    ("jarvis закрой стим", True, "закрой стим"),
+    ("закрой стим, джарвис", True, "закрой стим,"),
+    ("привет джарвис", True, "привет"),
+]
+
+
+def test_wake_distorted_forms_found():
+    for phrase, found, rest in WAKE_CASES:
+        ok, tail = routing.find_wake(phrase)
+        assert ok is found, phrase
+        assert routing.normalize(tail) == routing.normalize(rest), phrase
+
+
+def test_wake_negatives_rejected():
+    for phrase in ("жарко", "жаркое", "варвара", "привет", "закрой стим"):
+        ok, _ = routing.find_wake(phrase)
+        assert not ok, phrase
+
+
+SLOT_CASES = {
+    "стим": "steam", "стем": "steam", "стэм": "steam", "с ним": "steam",
+    "с тем": "steam", "ским": "steam", "тим": "steam", "steam": "steam",
+    "соку": "cs2", "кс два": "cs2", "кс2": "cs2", "counter strike": "cs2",
+    "дискорд": "discord", "хром": "chrome", "телеграм": "telegram",
+}
+
+
+def test_slot_distorted_forms_map_to_entities():
+    for slot, expected in SLOT_CASES.items():
+        name, score = routing.normalize_slot(slot)
+        assert name == expected, f"{slot!r} → {name} ({score:.2f})"
+
+
+def test_slot_negatives_not_steam():
+    for slot in ("дом", "пк", "компьютер", "дома"):
+        name, _ = routing.normalize_slot(slot)
+        assert name != "steam", slot
+
+
+def test_canon_verb_forms():
+    assert routing.canon_verb("закроешь") == "закрой"
+    assert routing.canon_verb("закрыть") == "закрой"
+    assert routing.canon_verb("запустить") == "запусти"
+    assert routing.canon_verb("открою") == "открой"
+
+
 # --- матчинг декларативного реестра на реальных фразах (группы команд) --------
 # Реестр по образцу настоящего: приоритет и обучающие фразы. Проверяем, что
 # «фраза → ожидаемый интент» определяется однозначно, без опоры на порядок строк.

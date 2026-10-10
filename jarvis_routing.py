@@ -29,6 +29,187 @@ def close_verb(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+#  Слово-активатор: нечёткий поиск (STT коверкает «джарвис» → «джервис» и т.п.)
+# ---------------------------------------------------------------------------
+# Известные искажения STT из реальных логов владельца. «джерри/джерси» — тоже
+# искажения активатора, а не чужие имена: выполняем команду, а не поправляем.
+WAKE_ALIASES = (
+    "джарвис", "джервис", "джарвес", "жарвис", "джарви", "джервис",
+    "джарвисе", "дарвис", "чарвис", "джерри", "джерси", "жарвес",
+    "гарвис", "jarvis",
+)
+# Слова, которые активатором НЕ являются (посторонняя речь рядом).
+_WAKE_NEGATIVES = ("жарко", "жаркое", "варвара", "варвар", "жар", "жара")
+
+
+def _latin_to_cyrillic(word: str) -> str:
+    """Транслитерация латиницы для сравнения («jarvis» → «джарвис»)."""
+    table = str.maketrans({
+        "a": "а", "b": "б", "c": "к", "d": "д", "e": "е", "f": "ф",
+        "g": "г", "h": "х", "i": "и", "j": "дж", "k": "к", "l": "л",
+        "m": "м", "n": "н", "o": "о", "p": "п", "q": "к", "r": "р",
+        "s": "с", "t": "т", "u": "у", "v": "в", "w": "в", "x": "кс",
+        "y": "и", "z": "з",
+    })
+    return word.translate(table)
+
+
+def _wake_phonetic(word: str) -> str:
+    """Фонетическая нормализация: ж/дж/ч, безударные а/е/и, вис/вес/вез.
+
+    Начальный согласный правим осторожно: только ж↔дж↔ч (реальные искажения
+    STT), но НЕ з/с/г — иначе «закрой» сольётся с «джарвис».
+    """
+    w = _latin_to_cyrillic(word.lower().replace("ё", "е"))
+    w = re.sub(r"^(д?ж|ч)", "дж", w)   # начальный согласный
+    w = re.sub(r"^з", "дж", w) if w.startswith(("зарв", "зерв")) else w
+    w = w.replace("а", "э").replace("е", "э").replace("и", "э").replace("о", "э")
+    w = re.sub(r"в(ис|ес|ез|из)$", "вэс", w)  # вис/вес/вез → одно
+    return w
+
+
+def _lev_ratio(a: str, b: str) -> float:
+    """Сходство строк 0..1 по Левенштейну (чистый Python, без зависимостей)."""
+    if a == b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[-1] + 1,
+                           prev[j - 1] + (ca != cb)))
+        prev = cur
+    return 1.0 - prev[-1] / max(len(a), len(b))
+
+
+def wake_match_score(word: str, candidates=WAKE_ALIASES) -> float:
+    """Лучшее сходство слова с известными формами активатора (0..1)."""
+    w = normalize(word)
+    if not w or w in _WAKE_NEGATIVES:
+        return 0.0
+    best = 0.0
+    for cand in candidates:
+        c = normalize(cand)
+        best = max(best, _lev_ratio(w, c), _lev_ratio(_wake_phonetic(w),
+                                                      _wake_phonetic(c)))
+    return best
+
+
+def find_wake(text: str, word: str = "джарвис", aliases=WAKE_ALIASES,
+              sensitivity: str = "normal") -> tuple[bool, str]:
+    """Нечёткий поиск активатора в первых/последних словах фразы.
+
+    Возвращает (найден, остаток фразы без активатора). Проверяются первые
+    3 и последнее слово — активатор бывает и в конце («закрой стим, джарвис»).
+    Пороги: strict 0.85 / normal 0.7 / soft 0.55. Точное вхождение каноники —
+    всегда 1.0. Короткие чужие слова («жарко», «варвара») отсекаются списком
+    _WAKE_NEGATIVES и низким скором.
+    """
+    thresholds = {"strict": 0.85, "normal": 0.7, "soft": 0.55}
+    thr = thresholds.get(sensitivity, 0.7)
+    words = normalize(text).split()
+    if not words:
+        return False, ""
+    cands = list(dict.fromkeys([normalize(word), *(normalize(a) for a in aliases)]))
+    # позиции: первые три слова + последнее (если фраза длиннее)
+    positions = list(range(min(3, len(words))))
+    if len(words) > 3:
+        positions.append(len(words) - 1)
+    best_idx, best_score = -1, 0.0
+    for i in positions:
+        s = wake_match_score(words[i], cands)
+        if s > best_score:
+            best_score, best_idx = s, i
+    if best_idx < 0 or best_score < thr:
+        return False, normalize(text)
+    rest = [w for j, w in enumerate(words) if j != best_idx]
+    return True, " ".join(rest).strip()
+
+
+# ---------------------------------------------------------------------------
+#  Нормализация слотов: искажения названий («закрой ским» → Steam)
+# ---------------------------------------------------------------------------
+# Ворох искажений STT для частых объектов: каноника ↔ кириллица ↔ латиница.
+SLOT_VARIANTS: dict[str, tuple[str, ...]] = {
+    "steam": ("steam", "стим", "стем", "стэм", "стиму", "с ним", "с тем",
+              "ским", "тим", "стим-у", "сытим"),
+    "cs2": ("cs2", "кс2", "кс 2", "кс два", "си эс два", "counter-strike 2",
+            "counter strike 2", "counter strike", "контр страйк",
+            "контр страйк 2", "кээс два", "соку"),
+    "discord": ("discord", "дискорд", "дескорд", "дискорта"),
+    "chrome": ("chrome", "хром", "хроме", "гоогле хром"),
+    "telegram": ("telegram", "телеграм", "телега", "телегу"),
+    "youtube": ("youtube", "ютуб", "ютюб", "ютьюб", "yotube"),
+    "github": ("github", "гитхаб", "гитхап", "гит hub"),
+    "roblox": ("roblox", "роблокс", "роблакс"),
+    "minecraft": ("minecraft", "майнкрафт", "майнкрафта"),
+    "genshin": ("genshin", "геншин", "геншина"),
+}
+# глагол → каноника: «закроешь/закрыть» → «закрой» и т.п.
+VERB_CANON = {
+    "закрой": "закрой", "закройте": "закрой", "закрыть": "закрой",
+    "закроешь": "закрой", "закрыл": "закрой", "закроем": "закрой",
+    "закрывай": "закрой", "закрытие": "закрой",
+    "открой": "открой", "открыть": "открой", "открою": "открой",
+    "откройте": "открой", "открывай": "открой",
+    "запусти": "запусти", "запустить": "запусти", "запускай": "запусти",
+    "запуск": "запусти", "запущу": "запусти",
+    "включи": "включи", "включить": "включи", "включай": "включи",
+    "найди": "найди", "найти": "найди", "найдите": "найди",
+}
+_ACTION_VERBS = {
+    "закрой": "close", "открой": "open", "запусти": "launch",
+    "включи": "turn_on", "найди": "search",
+}
+
+
+def canon_verb(word: str) -> str:
+    """Привести глагол к повелительной форме («закроешь» → «закрой»)."""
+    return VERB_CANON.get(normalize(word), normalize(word))
+
+
+def slot_match_score(slot: str, variants: tuple[str, ...]) -> float:
+    """Сходство слота с вариантами объекта: склейка «с ним»→«сним» + Левенштейн."""
+    s = normalize(slot).replace(" ", "")
+    if not s:
+        return 0.0
+    best = 0.0
+    for v in variants:
+        v_n = normalize(v).replace(" ", "")
+        best = max(best, _lev_ratio(s, v_n),
+                   _lev_ratio(_latin_to_cyrillic(s), _latin_to_cyrillic(v_n)))
+    return best
+
+
+def normalize_slot(slot: str, entities: dict[str, tuple[str, ...]] | None = None,
+                   threshold: float = 0.6) -> tuple[str | None, float]:
+    """Слот после глагола → каноническое имя объекта или (None, лучший скор).
+
+    entities: имя → варианты (по умолчанию SLOT_VARIANTS). Контекст глагола
+    позволяет мягкое сравнение: «ским» после «закрой» — это Steam, а в
+    свободном тексте «дом» Steam'ом не станет.
+    """
+    table = entities or SLOT_VARIANTS
+    s = normalize(slot)
+    if not s:
+        return None, 0.0
+    best_name, best_score = None, 0.0
+    for name, variants in table.items():
+        # сначала прямое вхождение варианта в слот
+        for v in variants:
+            if normalize(v) and normalize(v) in s:
+                return name, 1.0
+        sc = slot_match_score(s, variants)
+        if sc > best_score:
+            best_score, best_name = sc, name
+    if best_score >= threshold:
+        return best_name, best_score
+    return None, best_score
+
+
+# ---------------------------------------------------------------------------
 #  Питание ПК — высший приоритет, до таблицы COMMANDS и до «закрой …»
 # ---------------------------------------------------------------------------
 _PC_RE = re.compile(
