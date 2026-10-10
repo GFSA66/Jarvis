@@ -210,3 +210,75 @@ def test_ensure_model_error_without_network(monkeypatch, tmp_path):
         assert "интернет" in str(e)
     else:
         raise AssertionError("должен быть STTError")
+
+
+# ---------------------------------------------------------------------------
+# Регрессия: выбор движка и обрезка многословных команд
+# ---------------------------------------------------------------------------
+
+def test_chain_table_defaults_and_fallback():
+    """Цепочка бэкендов: дефолт + страховка запасными, неизвестный движок → дефолт."""
+    assert stt.STTEngine({"engine": "vosk"})._chain() == ["vosk", "google"]
+    assert stt.STTEngine({"engine": "google"})._chain() == ["google", "vosk"]
+    assert stt.STTEngine({"engine": "hybrid"})._chain() == ["vosk", "vosk_plain", "google"]
+    assert stt.STTEngine({"engine": "whisper"})._chain() == ["whisper", "vosk", "google"]
+    # неизвестный/битый движок в старом конфиге — молча дефолт, а не падение
+    assert stt.STTEngine({"engine": "непонятно"})._chain() == ["vosk", "google"]
+
+
+def test_unknown_engine_in_config_falls_back_to_vosk(monkeypatch):
+    eng = stt.STTEngine({"engine": "непонятно", "confidence_min": 0.3})
+    monkeypatch.setattr(stt, "VoskBackend",
+                        lambda cfg, grammar=None, use_grammar=True:
+                        _fake_backend("vosk", "стоп", 0.9))
+    res = eng.transcribe(b"\x00" * 100, 16000)
+    assert res.text == "стоп" and res.engine == "vosk" and not res.rejected
+
+
+def test_whisper_unavailable_falls_back_to_vosk(monkeypatch):
+    """Выбран whisper, но пакет не установлен → работаем на запасном (vosk), без ошибки.
+
+    Раньше это давало «Распознавание недоступно» на каждой фразе и Джарвис не реагировал.
+    """
+    eng = stt.STTEngine({"engine": "whisper", "confidence_min": 0.3})
+    monkeypatch.setattr(stt, "WhisperBackend",
+                        lambda cfg, prompt="":
+                        _fake_backend("whisper", "", 0.0,
+                                      errors=stt.STTError("Бэкенд whisper не установлен: pip install faster-whisper")))
+    monkeypatch.setattr(stt, "VoskBackend",
+                        lambda cfg, grammar=None, use_grammar=True:
+                        _fake_backend("vosk", "открой настройки", 0.9))
+    res = eng.transcribe(b"\x00" * 100, 16000)
+    assert res.text == "открой настройки" and res.engine == "vosk" and not res.rejected
+
+
+def test_engine_vosk_grammar_off_by_default(monkeypatch):
+    """По умолчанию vosk распознаёт свободно (без жёсткой грамматики).
+
+    Иначе многословные команды («открой настройки», «выключи компьютер»)
+    обрубались до одного слова из списка грамматики.
+    """
+    eng = stt.STTEngine({"engine": "vosk"})
+    seen = {}
+
+    def fake_vosk(cfg, grammar=None, use_grammar=True):
+        seen["use_grammar"] = use_grammar
+        return _fake_backend("vosk", "открой настройки", 0.9)
+
+    monkeypatch.setattr(stt, "VoskBackend", fake_vosk)
+    eng.transcribe(b"\x00" * 100, 16000)
+    assert seen.get("use_grammar") is False
+
+
+def test_engine_vosk_grammar_on_when_enabled(monkeypatch):
+    """Если в настройках включить stt.grammar — грамматика снова применяется."""
+    eng = stt.STTEngine({"engine": "vosk", "grammar": True})
+    seen = {}
+
+    def fake_vosk(cfg, grammar=None, use_grammar=True):
+        seen["use_grammar"] = use_grammar
+        return _fake_backend("vosk", "пауза", 0.9)
+
+    monkeypatch.setattr(stt, "VoskBackend", fake_vosk)
+    eng.transcribe(b"\x00" * 100, 16000)
+    assert seen.get("use_grammar") is True

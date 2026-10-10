@@ -325,7 +325,7 @@ def load_config() -> dict:
     for p in config_files():
         if p.is_file():
             try:
-                with open(p, encoding="utf-8") as f:
+                with open(p, encoding="utf-8-sig") as f:  # utf-8-sig: терпим BOM от редакторов
                     _apply(cfg, json.load(f))
                 print(f"[config] загружен {p}")
             except Exception as e:
@@ -415,7 +415,7 @@ def save_user_config(patch: dict) -> None:
     data: dict = {}
     if path.is_file():
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))  # utf-8-sig: терпим BOM от редакторов
         except Exception:
             shutil.copy2(path, path.with_suffix(".json.bak"))  # битый файл не теряем
             data = {}
@@ -431,6 +431,35 @@ def save_user_config(patch: dict) -> None:
     os.replace(tmp, path)
     reload_config()
     notify("Настройки сохранены.")
+
+
+def reset_stt_engine() -> None:
+    """Аварийный сброс движка распознавания на Google в ~/.jarvis/config.json.
+
+    Нужен, когда в конфиг попал сломанный/неизвестный движок и вернуться из
+    окна настроек нельзя. Пишем только stt.engine, остальное в конфиге не трогаем.
+    Без Tk/notify — безопасно вызывать из CLI (--reset-stt) до создания Notifier.
+    """
+    path = user_config_path()
+    data: dict = {}
+    if path.is_file():
+        try:
+            # utf-8-sig: некоторые редакторы (Notepad, VS Code) добавляют BOM —
+            # без этого json упал бы на нём и мы начали бы с пустого конфига.
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            shutil.copy2(path, path.with_suffix(".json.bak"))  # битый файл не теряем
+            data = {}
+    stt_section = data.get("stt")
+    if not isinstance(stt_section, dict):
+        stt_section = {}
+    stt_section["engine"] = "google"
+    data["stt"] = stt_section
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+    reload_config()
 
 
 def log_error(context: str, exc: BaseException) -> None:
@@ -3400,10 +3429,26 @@ def _process_inner(text: str, refined: bool = False) -> None:
         return
 
     wake = CFG["wake_word"]
+    # Обращение к Джарвису: слово-активатор либо имя в фразе, либо «держит внимание»
+    # (окно внимания — значит недавно уже обращались). Считаем адресацию ДО всех
+    # гейтов, иначе команды без wake-слова молча отбрасываются (баг «не реагирует»).
+    named = any(n in text for n in CFG["ai"]["names"])
+    attentive = time.time() < STATE.attention_until
+    addressed = named or attentive
+
     if wake["enabled"] and not refined:  # при повторе после уточнения wake уже проверен
-        if wake["word"] not in text:
-            return
-        text = text.replace(wake["word"], "", 1).strip()
+        if wake["word"] in text:
+            addressed = True
+            text = text.replace(wake["word"], "", 1).strip()
+            # Одиночное обращение «Джарвис»: открываем окно внимания и коротко
+            # отвечаем — следующая команда уже не потребует wake-слова.
+            if not text or jarvis_history.is_filler(text):
+                window = (CFG["ai"].get("chat") or {}).get("attention_sec", 25)
+                STATE.attention_until = time.time() + max(0.0, window)
+                notify("Да, господин. Слушаю.")
+                return
+        elif not addressed:
+            return  # фраза не к Джарвису (нет wake-слова, имени, нет окна внимания)
 
     # Питание ПК — самый высокий приоритет: «выключи пк» никогда не доходит
     # до обработчика закрытия окон, даже если STT исказило слово.
@@ -3415,16 +3460,13 @@ def _process_inner(text: str, refined: bool = False) -> None:
         jarvis_history.DISPATCH.set("команда", text, "выполнена")
         return
 
-    # Обращение к Джарвису: слово-активатор уже проверено выше, иначе ищем имя в фразе.
-    # Если Джарвис «держит внимание» (только что говорили) — имя можно не называть.
-    named = any(n in text for n in CFG["ai"]["names"])
-    attentive = time.time() < STATE.attention_until
-    addressed = bool(wake["enabled"]) or named or attentive
     # В окне внимания филлеры/обрывки («ну», «давай», «ага») не выполняются
     # и не отправляются в нейросеть — молча.
     if addressed and jarvis_history.is_filler(text):
         return
-    if addressed and ai_ready():
+    # Окно внимания обновляем при любом обращении (в том числе офлайн, без ИИ),
+    # чтобы следующие команды без wake-слова тоже доходили.
+    if addressed:
         window = (CFG["ai"].get("chat") or {}).get("attention_sec", 25)
         STATE.attention_until = time.time() + max(0.0, window)
     ask = ai_question(text) if addressed and ai_ready() else None
@@ -3887,9 +3929,15 @@ def main() -> None:
     ap.add_argument("--clipboard-test", action="store_true", help="проверить чтение текста из буфера обмена")
     ap.add_argument("--stt-debug", action="store_true",
                     help="показывать диагностику распознавания (движок, уверенность, текст) и писать stt_debug.log")
+    ap.add_argument("--reset-stt", action="store_true",
+                    help="аварийно вернуть распознавание на Google (если выбранный движок сломан)")
     args = ap.parse_args()
     if args.stt_debug:
         STT_DEBUG = True
+    if args.reset_stt:
+        reset_stt_engine()
+        print("[ok] Движок распознавания сброшен на Google. Остальные настройки не тронуты.")
+        return
     if args.check:
         print_check()
         return
