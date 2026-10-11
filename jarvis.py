@@ -3644,7 +3644,7 @@ def _process_inner(text: str, refined: bool = False) -> None:
             # Адресованной речи слой управляет целиком; «ignore» не молчит —
             # фраза уходит ниже, где нейросеть ответит на вопрос/шутку.
             if decision.action == "clarify":
-                _slot_ask(decision.intent or "open", "Что/чего вы сказать?")
+                _slot_ask(decision.intent or "open", "Что вы имели в виду?")
                 return
             if decision.action == "confirm":
                 _process_confirmation(text)
