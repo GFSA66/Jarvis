@@ -123,11 +123,27 @@ def _fix_ru_hotkeys(win) -> None:
 
 
 def _place_over(win, parent) -> None:
-    """Центрируем окно над родителем (размеры берём в реальных пикселях — без путаницы с масштабом)."""
+    """Центрируем окно над родителем и зажимаем в границы экрана.
+
+    Раньше окно просто центрировалось по родителю: если родитель у самого
+    края экрана (или при масштабировании Windows), диалог уходил за край и
+    кнопки становились недоступны. Учитываем DPI-масштаб customtkinter:
+    geometry — в логических единицах, winfo_screen* — в физических пикселях.
+    """
     win.update_idletasks()
-    x = parent.winfo_rootx() + (parent.winfo_width() - win.winfo_reqwidth()) // 2
-    y = parent.winfo_rooty() + (parent.winfo_height() - win.winfo_reqheight()) // 2
-    win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    try:
+        scale = float(ctk.ScalingTracker.get_widget_scaling(win)) or 1.0
+    except Exception:
+        scale = 1.0
+    # запрошенный размер окна (в логических единицах geometry)
+    ww, wh = win.winfo_reqwidth() / scale, win.winfo_reqheight() / scale
+    x = parent.winfo_rootx() / scale + (parent.winfo_width() / scale - ww) // 2
+    y = parent.winfo_rooty() / scale + (parent.winfo_height() / scale - wh) // 2
+    x = max(0, min(x, sw / scale - ww))
+    y = max(0, min(y, sh / scale - wh))
+    # geometry принимает логические единицы, а отступы окна задаёт в физических
+    win.geometry(f"{int(ww)}x{int(wh)}+{int(x * scale)}+{int(y * scale)}")
 
 
 def _make_modal(d, parent) -> None:
@@ -386,6 +402,87 @@ def _short(text: str, limit: int = 90) -> str:
 
 
 # ============================================================================
+#  Навигация по вкладкам
+# ============================================================================
+
+class TabHost(ctk.CTkFrame):
+    """Разметка «боковое меню + содержимое» вместо CTkTabview.
+
+    Встроенная сегментная кнопка CTkTabview рисует все вкладки в одну строку
+    без переноса: при 11–13 вкладках кнопки наслаиваются друг на друга, а при
+    масштабировании Windows (125–150%) уходят за край окна. Здесь вкладки —
+    вертикальное меню слева: оно не наслаивается при любой ширине и масштабе,
+    а при нехватке высоты просто скроллится. Содержимое — справа.
+
+    Мини-API, совместимый с прежним использованием CTkTabview:
+    add(name) -> фрейм содержимого; set(name) — показать; get() — текущая.
+    """
+
+    def __init__(self, parent, sidebar_width: int = 190):
+        super().__init__(parent, fg_color="transparent")
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self._side = ctk.CTkScrollableFrame(self, fg_color="transparent",
+                                            width=sidebar_width, corner_radius=12)
+        self._side.grid(row=0, column=0, sticky="nsw")
+        self._side.grid_columnconfigure(0, weight=1)
+
+        self._content = ctk.CTkFrame(self, fg_color="#091522", corner_radius=16,
+                                     border_width=1, border_color=CARD_BORDER)
+        self._content.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
+        self._content.grid_columnconfigure(0, weight=1)
+        self._content.grid_rowconfigure(0, weight=1)
+
+        self._names: list[str] = []
+        self._frames: dict[str, ctk.CTkFrame] = {}
+        self._buttons: dict[str, ctk.CTkButton] = {}
+        self._current = ""
+
+    def add(self, name: str, scroll: bool = True) -> ctk.CTkFrame:
+        """Добавить вкладку и вернуть фрейм для её содержимого.
+
+        scroll=True — содержимое оборачивается в прокрутку, чтобы при любом
+        размере окна и масштабе Windows ничего не обрезалось и не уходило за
+        край. Табличным вкладкам и вкладкам со своей прокруткой передают
+        scroll=False, иначе получится двойная полоса прокрутки.
+        """
+        frame = ctk.CTkFrame(self._content, fg_color="transparent")
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.grid_rowconfigure(0, weight=1)
+        frame.grid_columnconfigure(0, weight=1)
+        self._frames[name] = frame
+        btn = ctk.CTkButton(
+            self._side, text=name, height=34, corner_radius=9, anchor="w",
+            font=_font(13, True), fg_color="transparent", text_color="#cfe0ef",
+            hover_color=GHOST_H, command=lambda n=name: self.set(n))
+        btn.grid(row=len(self._names), column=0, sticky="ew", padx=6, pady=(0, 4))
+        self._buttons[name] = btn
+        self._names.append(name)
+        if not self._current:
+            self.set(name)
+        if not scroll:
+            return frame
+        view = ctk.CTkScrollableFrame(frame, fg_color="transparent")
+        view.grid(row=0, column=0, sticky="nsew")
+        view.grid_columnconfigure(0, weight=1)
+        return view
+
+    def set(self, name: str) -> None:
+        """Показать вкладку и подсветить её кнопку."""
+        self._current = name
+        self._frames[name].tkraise()
+        for n, btn in self._buttons.items():
+            if n == name:
+                btn.configure(fg_color=ACCENT, text_color="#04141a", hover_color=ACCENT_H)
+            else:
+                btn.configure(fg_color="transparent", text_color="#cfe0ef", hover_color=GHOST_H)
+
+    def get(self) -> str:
+        return self._current
+
+
+# ============================================================================
 #  Главное окно
 # ============================================================================
 
@@ -418,10 +515,29 @@ class SettingsWindow:
         self.history_read, self.history_clear, self.history_run = history_read, history_clear, history_run
         w = self.win = ctk.CTkToplevel(root)
         w.title("Джарвис — настройки")
-        w.geometry("980x730")
-        w.minsize(840, 610)
         w.configure(fg_color=WINDOW_BG)
         _set_icon(w)
+        # Размер не больше рабочей области экрана и всегда по центру: раньше
+        # окно 980x730 открывалось в (0,0) и при масштабировании Windows
+        # нижние кнопки («Сохранить»/«Закрыть») уходили за край экрана.
+        w.update_idletasks()
+        sw, sh = w.winfo_screenwidth(), w.winfo_screenheight()
+        # customtkinter масштабирует окно под DPI Windows: geometry задаётся в
+        # логических единицах, а на экране занимает их × scaling. winfo_screen*
+        # при этом отдаёт ФИЗИЧЕСКИЕ пиксели. Без поправки на масштаб окно
+        # 980x730 при 125% превращалось в 1225x912 физических и его низ (кнопки
+        # «Сохранить»/«Закрыть») уходил за край экрана. Переводим доступные
+        # физические пиксели экрана в логические единицы geometry.
+        try:
+            scale = float(ctk.ScalingTracker.get_widget_scaling(w)) or 1.0
+        except Exception:
+            scale = 1.0
+        avail_w = sw / scale
+        avail_h = sh / scale
+        width = int(min(980, avail_w - 40))
+        height = int(min(730, avail_h - 110))
+        w.geometry(f"{width}x{height}+{int((sw - width * scale) / 2)}+{int((sh - height * scale) / 2)}")
+        w.minsize(int(min(840, avail_w - 40)), int(min(610, avail_h - 110)))
 
         head = ctk.CTkFrame(w, fg_color=HEADER_BG, corner_radius=18,
                             border_width=1, border_color=CARD_BORDER)
@@ -439,41 +555,22 @@ class SettingsWindow:
                      fg_color="#102b29", corner_radius=12, padx=13, pady=7).pack(
                          side="right", padx=18, pady=14)
 
-        tabs = self.tabs = ctk.CTkTabview(
-            w, fg_color="#091522", corner_radius=16, border_width=1, border_color=CARD_BORDER,
-            segmented_button_fg_color="#12253a", segmented_button_selected_color=ACCENT,
-            segmented_button_selected_hover_color=ACCENT_H,
-            segmented_button_unselected_color="#12253a",
-            segmented_button_unselected_hover_color=GHOST_H)
-        # Встроенная сегментная кнопка CTkTabview рисует все вкладки в одну строку
-        # без переноса — при 11–12 вкладках кнопки наслаиваются друг на друга.
-        # Прячем её (в текущей версии CTk она на grid) и рисуем свою панель
-        # с переносом по строкам.
-        tabs._segmented_button.grid_forget()
-
         names = ["Мои команды", "Игры Steam", "Сайты", "Ссылки", "Общие",
                  "Безопасность", "Уведомления", "Интеграции", "Диктовка", "Распознавание",
                  "История"]
         if ai is not None:
             names.append("Нейросеть")
-        t = {name: tabs.add(name) for name in names + ["Пути"]}
-        self._tab_names = list(names) + ["Пути"]
-        self._tab_selected = self._tab_names[0]
-
-        self._tab_bar = tab_bar = ctk.CTkFrame(w, fg_color="transparent")
-        tab_bar.pack(fill="x", padx=18, pady=(0, 8))
-        self._tab_buttons: dict[str, ctk.CTkButton] = {}
-        for name in self._tab_names:
-            btn = ctk.CTkButton(
-                tab_bar, text=name, height=34, corner_radius=10,
-                font=_font(13, True), fg_color="#12253a",
-                text_color="#cfe0ef", hover_color=GHOST_H,
-                command=lambda n=name: self._select_tab(n))
-            self._tab_buttons[name] = btn
-        self._tab_bar_width = 0
-        tab_bar.bind("<Configure>", self._relayout_tabs, add="+")
-        self._select_tab(names[0])
-
+        # Навигация — боковое меню (TabHost): вертикальный список кнопок не
+        # наслаивается и не уходит за край при любом масштабе, в отличие от
+        # сегментной кнопки CTkTabview. Содержимое вкладок прокручивается само,
+        # поэтому окно не «распирает» и кнопки снизу всегда на виду.
+        self.tabs = tabs = TabHost(w)
+        # Вкладки со собственной прокруткой (таблицы и те, что сами создают
+        # CTkScrollableFrame) — scroll=False, иначе будет двойная полоса.
+        own_scroll = {"Мои команды", "Игры Steam", "Сайты",
+                      "Общие", "Нейросеть", "Распознавание"}
+        t = {name: tabs.add(name, scroll=name not in own_scroll)
+             for name in names + ["Пути"]}
         tabs.pack(fill="both", expand=True, padx=18, pady=(0, 8))
 
         self.t_cmd = TableTab(
@@ -519,48 +616,19 @@ class SettingsWindow:
         self.status = ctk.CTkLabel(bottom, text="Готово к настройке", font=_font(13),
                                    text_color=MUTED, anchor="w")
         self.status.pack(side="left", fill="x", expand=True, padx=(16, 8), pady=10)
-        _button(bottom, "Закрыть", w.destroy, width=100).pack(side="right")
+        _button(bottom, "Закрыть", w.destroy, width=100).pack(side="right", padx=(0, 10), pady=8)
         self.btn_save = _button(bottom, "Сохранить", self.save, "accent", 120)
-        self.btn_save.pack(side="right", padx=(0, 10), pady=8)
-        bottom.winfo_children()[-1].pack_configure(pady=8)
+        self.btn_save.pack(side="right", pady=8)
         w.bind("<Control-s>", lambda e: self.save())
 
         w.lift()
         w.focus_force()
 
     # --- вкладки ---------------------------------------------------------
-    def _select_tab(self, name: str) -> None:
-        """Показать вкладку и подсветить её кнопку в панели."""
-        self._tab_selected = name
-        self.tabs.set(name)
-        for n, btn in self._tab_buttons.items():
-            if n == name:
-                btn.configure(fg_color=ACCENT, text_color="#04141a", hover_color=ACCENT_H)
-            else:
-                btn.configure(fg_color="#12253a", text_color="#cfe0ef", hover_color=GHOST_H)
-
-    def _relayout_tabs(self, event=None) -> None:
-        """Разложить кнопки вкладок по строкам с переносом (против наслаивания).
-
-        Вызывается на каждый <Configure> панели; при неизменной ширине — no-op,
-        чтобы избежать цикла перерисовок.
-        """
-        if event is not None and event.width == self._tab_bar_width:
-            return
-        self._tab_bar_width = event.width if event is not None else self._tab_bar.winfo_width()
-        avail = max(0, self._tab_bar_width - 4)
-        x = row = col = 0
-        for name in self._tab_names:
-            btn = self._tab_buttons[name]
-            btn.update_idletasks()
-            bw = btn.winfo_reqwidth() + 8  # 8 — зазор между кнопками
-            if x > 0 and x + bw > avail:
-                x = 0
-                row += 1
-                col = 0
-            btn.grid(row=row, column=col, sticky="w", padx=(0, 8), pady=3)
-            col += 1
-            x += bw
+    @property
+    def _tab_selected(self) -> str:
+        """Текущая вкладка (синхронизирована с TabHost)."""
+        return self.tabs.get()
 
     @staticmethod
     def _card(parent, title: str, row: int) -> ctk.CTkFrame:
