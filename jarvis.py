@@ -37,6 +37,13 @@ from urllib.parse import quote_plus
 import jarvis_routing
 import jarvis_history
 import jarvis_stt
+import jarvis_understand
+from jarvis_understand import (
+    build_lexicon as build_understand_lexicon,
+    Decision,
+    Hypothesis,
+    understand,
+)
 
 
 _STARTUP_DATA_DIR = Path(os.environ.get("JARVIS_HOME") or (Path.home() / ".jarvis"))
@@ -183,7 +190,13 @@ YT_MUSIC_WINDOW_TITLE = "YouTube Music"
 
 DEFAULT_CONFIG = {
     "language": "ru-RU",
-    "wake_word": {"enabled": False, "word": "джарвис"},
+    "wake_word": {
+        "enabled": False,
+        "word": "джарвис",
+        "aliases": ["джервис", "джарвес", "жарвис", "джарви", "дарвис", "чарвис",
+                    "джерри", "джерси", "jarvis"],
+        "sensitivity": "normal",  # strict | normal | soft
+    },
     "voice": {"enabled": True, "engine": "piper", "piper_voice": "dmitri",
               "id": None, "rate": 175},
     "dictation": {"delay_sec": 3, "paste_delay": 0.6, "restore_clipboard": True,
@@ -679,6 +692,96 @@ def close_app(process: str, display: str) -> None:
         notify(f"Не удалось закрыть {display} (код {rc}).", ok=False)
 
 
+def _steam_alive() -> bool:
+    """Есть ли живые процессы Steam (проверка эффекта, а не «закрыто» вслепую)."""
+    try:
+        import psutil
+    except ImportError:
+        return True  # проверить нечем — считаем, что жив
+    # Steam Client Service может корректно остаться запущенной после выхода из
+    # клиента; это не означает, что Steam UI не закрылся.
+    names = {"steam.exe", "steamwebhelper.exe"}
+    try:
+        return any((p.info.get("name") or "").lower() in names
+                   for p in psutil.process_iter(["name"]))
+    except Exception:
+        return True
+
+
+_GAME_EXE = {
+    "cs2": (("cs2.exe",), "Counter-Strike 2"),
+    "minecraft": (("minecraftlauncher.exe", "javaw.exe"), "Minecraft"),
+    "roblox": (("robloxplayerbeta.exe",), "Roblox"),
+    "genshin": (("genshinimpact.exe", "yuanshen.exe"), "Genshin Impact"),
+}
+
+
+def close_game_process(game: str) -> None:
+    """Закрыть процесс игры с проверкой, что он исчез; иначе — честная причина."""
+    exes, title = _GAME_EXE.get(game, ((), game))
+
+    def still_alive() -> bool:
+        try:
+            import psutil
+        except ImportError:
+            return True
+        try:
+            live = {p.info.get("name", "").lower() for p in psutil.process_iter(["name"])}
+        except Exception:
+            return True
+        return any(e in live for e in exes)
+
+    if exes and not still_alive():
+        notify(f"{title} и так не запущен.", ok=False)
+        return
+
+    def work():
+        for exe in exes:
+            run_quiet(["taskkill", "/IM", exe, "/F", "/T"])
+        deadline = time.time() + 5.0
+        while time.time() < deadline and still_alive():
+            time.sleep(0.3)
+        if still_alive():
+            notify(f"{title} не закрылся: процесс держится. "
+                   "Закрой игру вручную через меню.", ok=False)
+        else:
+            notify(f"Закрыл {title}.")
+    confirm("закрытие игры", f"Закрыть {title}?", lambda: _async("Закрытие игры", work), True)
+
+
+def close_steam() -> None:
+    """Штатное завершение Steam (он прячется в трей — WM_CLOSE окон мало).
+
+    Сначала пробуем вежливо: steam.exe -shutdown; затем проверяем по psutil,
+    что процессы исчезли. Жёсткий taskkill — только после подтверждения.
+    """
+    if not _steam_alive():
+        notify("Steam и так не запущен.", ok=False)
+        return
+
+    def shutdown():
+        exe = find_steam()
+        if exe:
+            popen([exe, "-shutdown"])
+        else:
+            run_quiet(["taskkill", "/IM", "steam.exe"])
+        deadline = time.time() + 8.0
+        while time.time() < deadline and _steam_alive():
+            time.sleep(0.4)
+        if _steam_alive():
+            confirm("закрытие steam",
+                    "Steam не закрылся штатно. Завершить процессы принудительно?",
+                    lambda: _async("Закрытие Steam", lambda: (
+                        run_quiet(["taskkill", "/IM", "steam.exe", "/F", "/T"]),
+                        notify("Закрыл Steam." if not _steam_alive()
+                               else "Steam не закрылся: процесс держится.", ok=_steam_alive() is False))),
+                    True)
+        else:
+            notify("Закрыл Steam.")
+    confirm("закрытие steam", "Закрыть Steam?",
+            lambda: _async("Закрытие Steam", shutdown), True)
+
+
 def open_url(url, label: str, study: bool = False) -> None:
     if not url:
         notify(f"Ссылка «{label}» не настроена — добавь её в config.json → urls.", ok=False)
@@ -1021,6 +1124,7 @@ class State:
         self.voice_enabled = bool(CFG["voice"]["enabled"])
         self.stop = threading.Event()
         self.attention_until = 0.0  # до этого момента Джарвис «держит внимание» — имя можно не называть
+        self.talk_mode = False  # режим разговора: без активатора, всё уходит нейросети
         self.dictation_mode = False
         self.dictation_last_seen = 0.0
         self.dictation_buffer = ""
@@ -1029,6 +1133,13 @@ class State:
         self.last_close_pids: list = []  # pid'ы для принудительного закрытия после подтверждения
         self.history_custom: tuple | None = None  # своя запись истории от текущей команды
         self.pending_clarify: tuple | None = None  # (opts, исходная фраза) при переспросе
+        self.pending_slot: dict | None = None  # ожидание слота: {verb, until}
+
+
+def _slot_ask(verb: str, question: str) -> None:
+    """Голосовой вопрос с окном ожидания слота ~8 с («Что закрыть?» → «steam»)."""
+    STATE.pending_slot = {"verb": jarvis_routing.canon_verb(verb), "until": time.time() + 8.0}
+    notify(question + " Жду уточнение.", force_speak=True)
 
 
 STATE = State()
@@ -1460,7 +1571,7 @@ def commands_text(full: bool = False) -> str:
 9. Таймеры: «таймер на 10 минут», «будильник на 7:30», «сколько осталось»
 10. Диктовка: «режим диктовки», «напечатай <текст>», «закончить диктовку»
 11. Утилиты: «сделай скриншот», «что запущено», «брось d20», «подбрось монетку»
-12. Нейросеть: «Джарвис, <вопрос>»; «забудь разговор»
+12. Нейросеть: «Джарвис, <вопрос>»; «забудь разговор»; «режим разговора» (болтовня без имени)
 13. Служебное: «список команд», «все команды», «история запросов», «голос»
 Мои команды: {len(CFG["commands"])} (скажи «все команды» — полный список)"""
     return f"""Список команд Джарвиса:
@@ -1474,7 +1585,8 @@ def commands_text(full: bool = False) -> str:
 — говорить можно подряд: после обращения Джарвис держит внимание 25 с (настройки → Нейросеть);
   помнит последние реплики («это норма?» понимает по прошлому ответу);
   несколько команд сразу: «открой стим и заметки», «запусти майнкрафт, потом музыку»;
-  «забудь разговор» / «новый разговор» — начать заново
+  «забудь разговор» / «новый разговор» — начать заново;
+  «режим разговора» — болтовня без «Джарвис»; «обычный режим» / «хватит болтать» — вернуться
 — история запросов — последние запросы к Джарвису; очисти историю — удалить их ({HISTORY_PATH})
 — геншин; майнкрафт; призм; роблокс — запуск игр и лаунчеров
 — игры Steam: {", ".join(sorted(CFG["games"]))}
@@ -2317,6 +2429,22 @@ def cmd_forget(t):
     notify("Забыл разговор. Начнём заново?")
 
 
+def cmd_talk_mode(t):
+    """«режим разговора» / «обычный режим» — свободная болтовня без активатора.
+
+    В режиме разговора фразы без имени уходят нейросеть (как будто обращение
+    прозвучало). Обычный режим — как раньше: реагировать только на активатор
+    из настроек (имя/wake-слово), команды работают как прежде.
+    """
+    off = any(s in t for s in ("выключ", "отключ", "обычн", "достаточно", "хватит"))
+    STATE.talk_mode = not off
+    STATE.attention_until = 0.0
+    if STATE.talk_mode:
+        notify("Режим разговора включён. Можно просто говорить — я слушаю.", force_speak=True)
+    else:
+        notify("Обычный режим. Реагирую на «Джарвис» и активатор из настроек.", force_speak=True)
+
+
 def cmd_track(t):
     m = TRACK_RE.search(t)
     play_track(m.group(1).strip())
@@ -2572,15 +2700,59 @@ def _game_key(t):
     «во что поиграть, только не киберпанк» не должен запускать Киберпанк."""
     if jarvis_routing.launch_blocked(t):
         return None
+    # Глагол решает: «закрой cs2» — это закрытие, а не запуск. Название игры
+    # в тексте недостаточно для запуска (баг: «закрой cs2» запускал игру).
+    if jarvis_routing.close_verb(jarvis_routing.normalize(t)):
+        return None
     negated = jarvis_routing.negated_terms(t, CFG["games"].keys())
     return next((k for k in CFG["games"]
                  if k not in negated and re.search(r"\b" + re.escape(k), t)), None)
+
+
+def _close_game_key(t):
+    """Название игры для закрытия («закрой cs2/кс два/counter strike»)."""
+    norm_t = jarvis_routing.normalize(t)
+    words = norm_t.split()
+    if words:
+        words[0] = jarvis_routing.canon_verb(words[0])
+        norm_t = " ".join(words)
+    m = re.search(r"\bзакрой\b\s*(.*)", norm_t)
+    slot_raw = (m.group(1) if m else "").strip(" ,.!?-—")
+    if not slot_raw:
+        return None
+    # прямые названия игр из конфига + сущности-искажения
+    for key in CFG["games"]:
+        if re.search(r"\b" + re.escape(key), slot_raw):
+            return key
+    entity, _score = jarvis_routing.normalize_slot(slot_raw)
+    if entity == "cs2":
+        return "cs2"
+    game_entities = {"minecraft": "майнкрафт", "roblox": "роблокс",
+                     "genshin": "геншин"}
+    for game, canon in game_entities.items():
+        if canon in slot_raw:
+            return game
+    return None
 
 
 def cmd_steam_game(t):
     key = _game_key(t)
     os.startfile(f"steam://rungameid/{CFG['games'][key]}")
     notify(f"Запускаю {key}.")
+
+
+def _launch_verb(t: str) -> bool:
+    """Есть ли в фразе явный глагол запуска/открытия («запусти», «открой»)."""
+    t = jarvis_routing.normalize(t)
+    return bool(re.search(
+        r"\b(?:запусти|запустить|запускай|открой|открыть|открою|включи|"
+        r"включить|стартуй|поехали)\b", t))
+
+
+def cmd_steam_maybe(t):
+    """Голое «стим» без глагола: переспросить, а не запускать молча."""
+    confirm("запуск steam", "Запустить Steam?",
+            lambda: _async("Запуск Steam", lambda: cmd_steam(t)), True)
 
 
 def cmd_steam(t):
@@ -2777,11 +2949,37 @@ def cmd_processes(t):
 
 def cmd_close_any(t):
     aliases = CFG.get("system", {}).get("app_aliases", {}) or {}
-    req = jarvis_routing.resolve_close(t, aliases)
+    # Локальная нормализация слота: «закрой ским/тим/с ним» → Steam без нейросети.
+    # Глагол приводим к канонике («закроешь» → «закрой»), слот — к сущности.
+    norm_t = jarvis_routing.normalize(t)
+    words = norm_t.split()
+    if words:
+        words[0] = jarvis_routing.canon_verb(words[0])
+        norm_t = " ".join(words)
+    m = re.search(r"\bзакрой\b\s*(.*)", norm_t)
+    slot_raw = (m.group(1) if m else "").strip(" ,.!?-—")
+    entity, _score = jarvis_routing.normalize_slot(slot_raw) if slot_raw else (None, 0.0)
+    if entity == "steam":
+        close_steam()
+        return
+    if entity == "cs2":
+        close_game_process("cs2")
+        return
+    game_key = _close_game_key(t)
+    if game_key == "cs2":
+        close_game_process("cs2")
+        return
+    if game_key in ("minecraft", "roblox", "genshin"):
+        close_game_process(game_key)
+        return
+    req = jarvis_routing.resolve_close(norm_t, aliases)
     if req["kind"] == "power_hint":
         notify(req["message"], ok=False)
         return
     if req["kind"] == "error":
+        if not (slot_raw or "").strip():
+            _slot_ask("закрой", "Что закрыть?")
+            return
         notify(req["message"] or "Не понял, какое окно закрыть.", ok=False)
         return
     label = req["label"]
@@ -3164,6 +3362,11 @@ COMMANDS = [
     Cmd(lambda t: has(t, "напомни"), cmd_remind, False),        # напомни мне …
     Cmd(lambda t: is_word(t, "голос"), cmd_voice, False),
     Cmd(lambda t: has(t, "забудь", "забыть") or has(t, "новый разговор"), cmd_forget, False),
+    Cmd(lambda t: has(t, "режим разговора", "режим болтовни") or has(t, "болтаем", "поговорим")
+        or (has(t, "обычный режим", "режим команд") and has(t, "включ", "переключ", "верн")),
+        cmd_talk_mode, False),
+    Cmd(lambda t: has(t, "выключ режим разговора", "отключ режим разговора",
+                      "хватит болтать", "достаточно болтать"), cmd_talk_mode, False),
     Cmd(lambda t: bool(TRACK_RE.search(t)), cmd_track, False),  # раньше «музык» и «песн»
     Cmd(lambda t: has(t, "музык") and CLOSE(t), lambda t: close_music_windows(), False),
     Cmd(lambda t: has(t, "музык"), lambda t: open_music(), False),
@@ -3176,7 +3379,10 @@ COMMANDS = [
         lambda t: launch_app(find_prism(), "Prism Launcher", "prism"), True),
     Cmd(lambda t: has(t, "роблокс", "roblox") and launch_ok(t), U("roblox"), True),
     Cmd(lambda t: has(t, "логик", "logik"), U("logika"), False),
-    Cmd(lambda t: has(t, "стим", "steam") and CLOSE(t), lambda t: close_app("steam.exe", "Steam"), False),
+    Cmd(lambda t: has(t, "стим", "steam") and CLOSE(t), lambda t: close_steam(), False),
+    # Голое «стим/steam» без глагола — не запуск молча, а вопрос «Запустить Steam?».
+    # Исключение — окно ожидания слота (там глагол уже известен).
+    Cmd(lambda t: has(t, "стим", "steam") and not _launch_verb(t), cmd_steam_maybe, True),
     Cmd(lambda t: has(t, "стим", "steam"), cmd_steam, True),
     Cmd(lambda t: has(t, "дискорд", "discord") and CLOSE(t), cmd_close_discord, False),
     Cmd(lambda t: has(t, "дискорд", "discord"), cmd_discord, True),
@@ -3392,8 +3598,76 @@ def process(text: str, refined: bool = False) -> None:
         _flush_history()
 
 
+def _understanding_context() -> dict:
+    """Снимок системы для лексикона: безопасные «голые» значения по умолчанию."""
+    return {"running": [], "windows": [], "folders": {}, "recent": []}
+
+
+def _process_confirmation(text: str) -> None:
+    """Подтверждение через нейросеть, если включена, иначе стандартный отклик."""
+    if CFG.get("understanding", {}).get("confirm_policy") == "ai" and jarvis_ai:
+        try:
+            if jarvis_ai and (CFG["ai"].get("enabled") or jarvis_ai.is_question(text)):
+                ask_ai(text)
+                return
+        except Exception:
+            log_error("confirm policy", None)
+    notify("Понял: выполню.", force_speak=True)
+
+
 def _process_inner(text: str, refined: bool = False) -> None:
     P = CFG["phrases"]
+    # Обращение к Джарвису считаем ДО слоя understand: иначе разговорные фразы
+    # с активатором («Джарвис, расскажи анекдот») слой «ignore» молча отбрасывал
+    # до того, как фраза доходила до нейросети («перестал отзываться»).
+    # Имя/wake-слово — из настроек; talk_mode — отдельный режим разговора.
+    named = any(n in text for n in CFG["ai"]["names"])
+    attentive = time.time() < STATE.attention_until
+    wake_hit = False
+    _wake_cfg = CFG["wake_word"]
+    if _wake_cfg.get("enabled") and not refined:
+        # Тот же нечёткий поиск, что и в wake-блоке ниже: адресация должна
+        # учитывать wake-слово до слоя understand, иначе фраза с одним только
+        # wake-словом (без имени) умирала как «не addressed».
+        wake_hit, _ = jarvis_routing.find_wake(
+            text, str(_wake_cfg.get("word") or "джарвис"),
+            jarvis_routing.WAKE_ALIASES + tuple(_wake_cfg.get("aliases") or ()),
+            str(_wake_cfg.get("sensitivity") or "normal"))
+    addressed = named or attentive or wake_hit or STATE.talk_mode
+    # Единый лексиконо-фонетический слой: для адресованной речи он решает,
+    # выполнять, уточнить, подтвердить или игнорировать фразу, прежде чем
+    # традиционные таблицы привлекают жёсткие искажения.
+    if CFG.get("understanding", {}).get("enabled", True) and text:
+        decision = understand([Hypothesis(text=text, confidence=0.7, engine="local")],
+                              cfg=CFG, context=_understanding_context())
+        if addressed:
+            # Адресованной речи слой управляет целиком; «ignore» не молчит —
+            # фраза уходит ниже, где нейросеть ответит на вопрос/шутку.
+            if decision.action == "clarify":
+                _slot_ask(decision.intent or "open", "Что/чего вы сказать?")
+                return
+            if decision.action == "confirm":
+                _process_confirmation(text)
+                return
+            if decision.action == "ignore":
+                _stt_debug(f"не понято (к Джарвису): {text!r}")
+        else:
+            # Не адресовано: команды выполняются как раньше («открой ютуб» без
+            # имени), фоновая болтовня молчит — лимит нейросети не тратим.
+            if decision.action == "ignore" and not _looks_like_command(text):
+                return
+            if decision.action in ("clarify", "confirm"):
+                return  # фоновый переспрос/подтверждение без обращения — молчим
+            _stt_debug(f"не адресовано, пропуск слоя: {text!r}")
+        # action == execute: повторно проходит legacy-диспетчер.
+    # Окно ожидания слота: «закрой» → «Что закрыть?» → «steam» = «закрой steam».
+    # Одиночное название без глагола вне окна — не действие, а вопрос.
+    if STATE.pending_slot and not refined:
+        slot_req = STATE.pending_slot
+        STATE.pending_slot = None
+        if time.time() <= slot_req.get("until", 0):
+            verb = str(slot_req.get("verb") or "")
+            return _process_inner(f"{verb} {text}".strip(), refined=True)
     if STATE.pending_clarify:
         opts, original = STATE.pending_clarify
         idx = jarvis_intents.clarify_choice(text, len(opts))
@@ -3429,17 +3703,19 @@ def _process_inner(text: str, refined: bool = False) -> None:
         return
 
     wake = CFG["wake_word"]
-    # Обращение к Джарвису: слово-активатор либо имя в фразе, либо «держит внимание»
-    # (окно внимания — значит недавно уже обращались). Считаем адресацию ДО всех
-    # гейтов, иначе команды без wake-слова молча отбрасываются (баг «не реагирует»).
-    named = any(n in text for n in CFG["ai"]["names"])
-    attentive = time.time() < STATE.attention_until
-    addressed = named or attentive
-
+    # Адресация (named/attentive/talk_mode) уже посчитана в начале _process_inner;
+    # здесь только уточняем по нечёткому wake-слову и вырезаем его из фразы.
     if wake["enabled"] and not refined:  # при повторе после уточнения wake уже проверен
-        if wake["word"] in text:
+        # Нечёткий поиск: STT коверкает «джарвис» → «джервис/джерри/джерси»,
+        # точная подстрока их отбрасывала («перестал реагировать»).
+        sensitivity = str(wake.get("sensitivity") or "normal")
+        found, rest = jarvis_routing.find_wake(
+            text, str(wake.get("word") or "джарвис"),
+            jarvis_routing.WAKE_ALIASES + tuple(wake.get("aliases") or ()),
+            sensitivity)
+        if found:
             addressed = True
-            text = text.replace(wake["word"], "", 1).strip()
+            text = rest
             # Одиночное обращение «Джарвис»: открываем окно внимания и коротко
             # отвечаем — следующая команда уже не потребует wake-слова.
             if not text or jarvis_history.is_filler(text):
@@ -3448,6 +3724,7 @@ def _process_inner(text: str, refined: bool = False) -> None:
                 notify("Да, господин. Слушаю.")
                 return
         elif not addressed:
+            _stt_debug(f"отброшено: нет активатора text={text!r}")
             return  # фраза не к Джарвису (нет wake-слова, имени, нет окна внимания)
 
     # Питание ПК — самый высокий приоритет: «выключи пк» никогда не доходит
@@ -3701,9 +3978,12 @@ def listener_loop(ready: threading.Event) -> None:
     """Микрофон + собственный VAD: адаптивный порог шума, предзапись (не режет
     первое слово), пауза после речи Джарвиса (подавление эха). PCM → audio_q."""
     stt_cfg = {**jarvis_stt.DEFAULTS, **(CFG.get("stt") or {})}
-    vad = jarvis_stt.StreamVAD(margin=float(stt_cfg.get("vad_energy_margin") or 2.0))
+    vad = jarvis_stt.StreamVAD(
+        margin=float(stt_cfg.get("vad_energy_margin") or 2.0),
+        min_rms=float(stt_cfg.get("vad_min_rms") or 120.0),
+        silence_ms=float(stt_cfg.get("vad_silence_ms") or 700.0))
     prebuffer_frames = max(1, int(int(stt_cfg.get("prebuffer_ms") or 400) / 30))
-    echo_tail = max(0, int(int(stt_cfg.get("echo_tail_ms") or 400) / 30))
+    echo_tail = max(0, int(int(stt_cfg.get("echo_tail_ms") or 300) / 30))
     max_frames = 33 * 12  # фраза не длиннее 12 с, как раньше
     sample_rate = 16000
     try:

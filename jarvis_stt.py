@@ -7,6 +7,8 @@
   hybrid  — vosk с грамматикой, при низкой уверенности/пустом тексте —
             vosk без грамматики, затем google (если есть сеть).
 
+# (проверка посадки 2)
+
 Модели скачиваются при первом запуске в ~/.jarvis/models (не в репозиторий
 и не в exe). Модуль чистый: Windows/PyAudio импортируются лениво, поэтому
 логика VAD и фильтров тестируется в Linux CI.
@@ -22,6 +24,10 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
+# понимание намерений (understanding) — в отдельном модуле,
+# STT возвращает текст/уверенность, а understanding решает интент/слот
+from jarvis_understand import Decision, Hypothesis, understand
+
 # Детерминированные дефолты для старых config.json без секции «stt»
 DEFAULTS = {
     "engine": "vosk",            # vosk | whisper | google | hybrid
@@ -31,9 +37,10 @@ DEFAULTS = {
     "models_dir": "",            # пусто → ~/.jarvis/models
     "prebuffer_ms": 400,         # предзапись до начала речи (не режет первое слово)
     "vad_energy_margin": 2.0,    # во сколько раз энергия речи выше тишины
-    "vad_silence_ms": 900,       # тишина для конца фразы (держит паузы внутри команды)
+    "vad_silence_ms": 700,       # тишина для конца фразы (держит паузы внутри команды;
+                                 # ниже — отзывчивее, но риск обрыва на долгой паузе)
     "vad_min_rms": 120.0,        # пол порога VAD: тихая речь не теряется
-    "echo_tail_ms": 400,         # пауза после речи Джарвиса (подавление эха)
+    "echo_tail_ms": 300,         # пауза после речи Джарвиса (подавление эха)
     "grammar": False,            # жёсткая FST-грамматика Vosk. False = свободное
                                  # распознавание (многословные команды не режутся);
                                  # True — только для шумного фона/коротких команд.
@@ -503,4 +510,27 @@ def build_grammar(words) -> list[str]:
         if w not in seen:
             seen.add(w)
             out.append(w)
+
     return out
+
+
+# ---------------------------------------------------------------------------
+#  Points where the understanding layer consumes STT output. The STT engine
+#  returns one text/confidence/engine triple; the understanding layer wants
+#  a list of Hypotheses (n-best). Here we normalise that shape.
+# ---------------------------------------------------------------------------
+
+
+def sttresult_to_hypotheses(result, acoustic=0.5):
+    if result.rejected or not result.text:
+        return []
+    return [
+        Hypothesis(text=result.text, confidence=result.confidence, engine=result.engine)
+    ]
+
+
+def sttresult_decision(result, cfg=None, context=None, lexicon=None):
+    if not result.text:
+        return Decision(None, None, "", 0.0, "ignore", (), "empty")
+    return understand([Hypothesis(text=result.text, confidence=result.confidence, engine=result.engine)],
+                      cfg=cfg, context=context, lexicon=lexicon)

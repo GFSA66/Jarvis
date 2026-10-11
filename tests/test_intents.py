@@ -213,6 +213,12 @@ def test_close_verb_exact_not_prefix():
     assert routing.resolve_close("открой блокнот")["kind"] == "error"
 
 
+def test_close_verb_accepts_supported_inflections_only():
+    assert routing.close_verb("закроешь steam")
+    assert routing.resolve_close("закроешь steam")["kind"] == "app"
+    assert not routing.close_verb("закройщик steam")
+
+
 def test_power_matrix_full():
     for phrase, expected in POWER_CASES.items():
         assert routing.power_intent(phrase) == expected, phrase
@@ -274,6 +280,12 @@ def test_canon_verb_forms():
     assert routing.canon_verb("закрыть") == "закрой"
     assert routing.canon_verb("запустить") == "запусти"
     assert routing.canon_verb("открою") == "открой"
+
+
+def test_close_action_never_becomes_launch_action():
+    # Чистая защита маршрутизации: закрытие не должно трактоваться как запуск.
+    assert routing.canon_verb("закроешь") == "закрой"
+    assert routing.close_verb(routing.normalize("закроешь кс два"))
 
 
 # --- матчинг декларативного реестра на реальных фразах (группы команд) --------

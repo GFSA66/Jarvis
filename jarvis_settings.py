@@ -445,8 +445,11 @@ class SettingsWindow:
             segmented_button_selected_hover_color=ACCENT_H,
             segmented_button_unselected_color="#12253a",
             segmented_button_unselected_hover_color=GHOST_H)
-        tabs._segmented_button.configure(font=_font(13, True))
-        tabs.pack(fill="both", expand=True, padx=18, pady=(0, 8))
+        # Встроенная сегментная кнопка CTkTabview рисует все вкладки в одну строку
+        # без переноса — при 11–12 вкладках кнопки наслаиваются друг на друга.
+        # Прячем её (в текущей версии CTk она на grid) и рисуем свою панель
+        # с переносом по строкам.
+        tabs._segmented_button.grid_forget()
 
         names = ["Мои команды", "Игры Steam", "Сайты", "Ссылки", "Общие",
                  "Безопасность", "Уведомления", "Интеграции", "Диктовка", "Распознавание",
@@ -454,6 +457,24 @@ class SettingsWindow:
         if ai is not None:
             names.append("Нейросеть")
         t = {name: tabs.add(name) for name in names + ["Пути"]}
+        self._tab_names = list(names) + ["Пути"]
+        self._tab_selected = self._tab_names[0]
+
+        self._tab_bar = tab_bar = ctk.CTkFrame(w, fg_color="transparent")
+        tab_bar.pack(fill="x", padx=18, pady=(0, 8))
+        self._tab_buttons: dict[str, ctk.CTkButton] = {}
+        for name in self._tab_names:
+            btn = ctk.CTkButton(
+                tab_bar, text=name, height=34, corner_radius=10,
+                font=_font(13, True), fg_color="#12253a",
+                text_color="#cfe0ef", hover_color=GHOST_H,
+                command=lambda n=name: self._select_tab(n))
+            self._tab_buttons[name] = btn
+        self._tab_bar_width = 0
+        tab_bar.bind("<Configure>", self._relayout_tabs, add="+")
+        self._select_tab(names[0])
+
+        tabs.pack(fill="both", expand=True, padx=18, pady=(0, 8))
 
         self.t_cmd = TableTab(
             t["Мои команды"], w,
@@ -508,6 +529,39 @@ class SettingsWindow:
         w.focus_force()
 
     # --- вкладки ---------------------------------------------------------
+    def _select_tab(self, name: str) -> None:
+        """Показать вкладку и подсветить её кнопку в панели."""
+        self._tab_selected = name
+        self.tabs.set(name)
+        for n, btn in self._tab_buttons.items():
+            if n == name:
+                btn.configure(fg_color=ACCENT, text_color="#04141a", hover_color=ACCENT_H)
+            else:
+                btn.configure(fg_color="#12253a", text_color="#cfe0ef", hover_color=GHOST_H)
+
+    def _relayout_tabs(self, event=None) -> None:
+        """Разложить кнопки вкладок по строкам с переносом (против наслаивания).
+
+        Вызывается на каждый <Configure> панели; при неизменной ширине — no-op,
+        чтобы избежать цикла перерисовок.
+        """
+        if event is not None and event.width == self._tab_bar_width:
+            return
+        self._tab_bar_width = event.width if event is not None else self._tab_bar.winfo_width()
+        avail = max(0, self._tab_bar_width - 4)
+        x = row = col = 0
+        for name in self._tab_names:
+            btn = self._tab_buttons[name]
+            btn.update_idletasks()
+            bw = btn.winfo_reqwidth() + 8  # 8 — зазор между кнопками
+            if x > 0 and x + bw > avail:
+                x = 0
+                row += 1
+                col = 0
+            btn.grid(row=row, column=col, sticky="w", padx=(0, 8), pady=3)
+            col += 1
+            x += bw
+
     @staticmethod
     def _card(parent, title: str, row: int) -> ctk.CTkFrame:
         card = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=14,
@@ -1030,7 +1084,9 @@ class SettingsWindow:
             "models_dir": old.get("models_dir", ""),
             "prebuffer_ms": old.get("prebuffer_ms", 400),
             "vad_energy_margin": old.get("vad_energy_margin", 2.0),
-            "echo_tail_ms": old.get("echo_tail_ms", 400),
+            "vad_silence_ms": old.get("vad_silence_ms", 700),
+            "vad_min_rms": old.get("vad_min_rms", 120.0),
+            "echo_tail_ms": old.get("echo_tail_ms", 300),
         }
 
     def _stt_test(self) -> None:

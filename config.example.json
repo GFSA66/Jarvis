@@ -1,5 +1,20 @@
 {
-  "wake_word": {"enabled": false, "word": "джарвис"},
+  "wake_word": {
+    "enabled": false,
+    "word": "джарвис",
+    "aliases": [
+      "джервис",
+      "джарвес",
+      "жарвис",
+      "джарви",
+      "дарвис",
+      "чарвис",
+      "джерри",
+      "джерси",
+      "jarvis"
+    ],
+    "sensitivity": "normal"
+  },
   "security": {
     "confirm_dangerous": true,
     "password_salt": "",
@@ -12,27 +27,41 @@
     "theme": "dark"
   },
   "stt": {
-    "engine": "vosk",
+    "engine": "hybrid",
     "model": "small",
     "whisper_model": "small",
     "confidence_min": 0.35,
     "models_dir": "",
     "prebuffer_ms": 400,
     "vad_energy_margin": 2.0,
-    "echo_tail_ms": 400
+    "vad_silence_ms": 700,
+    "vad_min_rms": 120.0,
+    "echo_tail_ms": 300
   },
   "dictation": {
     "method": "auto",
     "char_delay_ms": 8,
     "autoformat": true,
     "idle_timeout_sec": 120,
-    "blacklist": ["пароль", "password", "1password", "bitwarden", "keepass"],
+    "blacklist": [
+      "пароль",
+      "password",
+      "1password",
+      "bitwarden",
+      "keepass"
+    ],
     "confirm_unknown": false,
     "indicator": true
   },
   "system": {
-    "app_aliases": {"хром": "chrome.exe", "блокнот": "notepad.exe"},
-    "sound_devices": {"наушники": "Headphones", "колонки": "Speakers"}
+    "app_aliases": {
+      "хром": "chrome.exe",
+      "блокнот": "notepad.exe"
+    },
+    "sound_devices": {
+      "наушники": "Headphones",
+      "колонки": "Speakers"
+    }
   },
   "integrations": {
     "weather_city": "",
@@ -40,12 +69,26 @@
     "longitude": "",
     "translation_language": "английский",
     "telegram_token": "",
-    "telegram_contacts": {"мама": "123456789"},
-    "discord_webhooks": {"общий": "https://discord.com/api/webhooks/..."},
+    "telegram_contacts": {
+      "мама": "123456789"
+    },
+    "discord_webhooks": {
+      "общий": "https://discord.com/api/webhooks/..."
+    },
     "test_project": "",
     "test_command": "pytest",
     "test_timeout_sec": 300,
     "hotkey": "ctrl+alt+j",
     "daily_reminders": []
+  },
+  "understanding": {
+    "enabled": true,
+    "high_confidence": 0.82,
+    "medium_confidence": 0.62,
+    "minimum_confidence": 0.44,
+    "confirm_policy": "voice",
+    "feedback": {
+      "pronunciations_file": ".jarvis/pronunciations.json"
+    }
   }
 }

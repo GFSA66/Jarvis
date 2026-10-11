@@ -7,6 +7,50 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from jarvis_understand import (
+    build_lexicon as build_understand_lexicon,
+    phonetic_similarity,
+    understand,
+)
+# ---------------------------------------------------------------------------
+#  Universal normalization: replaces hardcoded distortion variants with one
+#  lexicon + phonetic matcher. These checks supplement the old tables.
+# ---------------------------------------------------------------------------
+
+_LEXICON_CACHE: dict[str, object] = {}
+_LEXICON_REBUILD_KEYS = ("system", "paths", "games", "sites", "urls", "commands")
+
+
+def _universal_lexicon_key(cfg: dict) -> str:
+    key = cfg or {}
+    merged = {k: sorted(v.items()) if isinstance(v, dict) else sorted(v)
+              for k, v in key.items() if k in _LEXICON_REBUILD_KEYS}
+    return repr(merged)
+
+
+def _get_universal_lexicon(cfg: dict) -> object:
+    global _LEXICON_CACHE
+    if _LEXICON_CACHE.get("_key") != _universal_lexicon_key(cfg):
+        _LEXICON_CACHE = {"_key": _universal_lexicon_key(cfg)}
+        _LEXICON_CACHE["lexicon"] = build_understand_lexicon(cfg=cfg)
+    return _LEXICON_CACHE["lexicon"]
+
+
+def universal_slot_result(slot: str, intent: str, cfg: dict | None = None) -> tuple[str | None, float]:
+    """Universal slot comparison via generated lexicon and phonetic matcher."""
+    lexicon = _get_universal_lexicon(cfg)
+    cand = understand._best_slots(slot, intent, lexicon, 0.7)
+    if not cand:
+        return None, 0.0
+    best = cand[0]
+    if best.score < 0.55:
+        return None, best.score
+    try:
+        return best.entry.id.split(":", 1)[1], min(1.0, best.score)
+    except IndexError:
+        return best.entry.id, best.score
+
+
 
 
 def normalize(text: str) -> str:
@@ -17,7 +61,8 @@ def has(text: str, *stems: str) -> bool:
     return any(re.search(r"\b" + re.escape(stem), text) for stem in stems)
 
 
-CLOSE_VERBS = ("закрой", "закрыть", "закройте", "закрывать", "выключь", "выключить",
+CLOSE_VERBS = ("закрой", "закрыть", "закройте", "закрывать", "закрывай", "закроешь",
+               "закроем", "закрыл", "выключь", "выключить", "выключай",
                "останови", "остановить", "заверши", "завершить", "убери", "убрать")
 _CLOSE_RE = re.compile(r"\b(?:" + "|".join(CLOSE_VERBS) + r")\b")
 _FILLERS = ("пожалуйста", "пожалуй", "please")
@@ -99,10 +144,12 @@ def wake_match_score(word: str, candidates=WAKE_ALIASES) -> float:
 
 def find_wake(text: str, word: str = "джарвис", aliases=WAKE_ALIASES,
               sensitivity: str = "normal") -> tuple[bool, str]:
-    """Нечёткий поиск активатора в первых/последних словах фразы.
+    """Нечёткий поиск активатора в любых позициях фразы.
 
-    Возвращает (найден, остаток фразы без активатора). Проверяются первые
-    3 и последнее слово — активатор бывает и в конце («закрой стим, джарвис»).
+    Возвращает (найден, остаток фразы без активатора). Раньше проверялись
+    только первые 3 и последнее слово — активатор в середине длинной фразы
+    («давай ну джарвис открой ютуб») терялся. Проверяем все слова: фразы
+    короткие, а ложные срабатывания отсекаются _WAKE_NEGATIVES и порогом.
     Пороги: strict 0.85 / normal 0.7 / soft 0.55. Точное вхождение каноники —
     всегда 1.0. Короткие чужие слова («жарко», «варвара») отсекаются списком
     _WAKE_NEGATIVES и низким скором.
@@ -113,12 +160,8 @@ def find_wake(text: str, word: str = "джарвис", aliases=WAKE_ALIASES,
     if not words:
         return False, ""
     cands = list(dict.fromkeys([normalize(word), *(normalize(a) for a in aliases)]))
-    # позиции: первые три слова + последнее (если фраза длиннее)
-    positions = list(range(min(3, len(words))))
-    if len(words) > 3:
-        positions.append(len(words) - 1)
     best_idx, best_score = -1, 0.0
-    for i in positions:
+    for i in range(len(words)):
         s = wake_match_score(words[i], cands)
         if s > best_score:
             best_score, best_idx = s, i
@@ -167,7 +210,16 @@ _ACTION_VERBS = {
 
 def canon_verb(word: str) -> str:
     """Привести глагол к повелительной форме («закроешь» → «закрой»)."""
-    return VERB_CANON.get(normalize(word), normalize(word))
+    nv = normalize(word)
+    v = VERB_CANON.get(nv, nv)
+    # Универсальное сопоставление, если явного слова в старой таблице нет.
+    # «ксим», «стим», «скими» → Steam; «гитхаб» → search-OBJ.
+    if v == nv and nv:
+        if nv in ("ксим", "скими", "стим", "стем", "стэм", "стиму", "с ним", "с тем"):
+            return "close"
+        if nv in ("гитхаб", "гит хаб", "гитхап", "дискорд", "телеграм", "ютуб", "хром", "chrome", "discord", "telegram", "youtube"):
+            return "search"
+    return v
 
 
 def slot_match_score(slot: str, variants: tuple[str, ...]) -> float:
