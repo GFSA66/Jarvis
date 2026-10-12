@@ -287,7 +287,10 @@ DEFAULT_CONFIG = {
         "files": True,                   # доступ к файлам ПК: чтение, создание, редактирование
         "self_edit": True,               # нейросеть может редактировать файлы самого Джарвиса
         "refine": False,                 # додумывать непонятые фразы нейросетью — только последний запасной шаг (по умолчанию выключено)
-        "chat": {"attention_sec": 25, "history_turns": 6},  # диалог: сколько секунд помнить обращение без имени
+        "chat": {"attention_sec": 25, "history_turns": 3},  # диалог: сколько секунд помнить обращение без имени
+        # Режим разговоров (talk_mode): подхват любых фраз без активатора.
+        # auto_exit_sec — автовыход по тишине; 0 — не выходить автоматически.
+        "talk": {"auto_exit_sec": 60},
     },
     # История запросов к Джарвису: %USERPROFILE%\.jarvis\history.jsonl
     # (команды «история запросов» и «очисти историю»)
@@ -372,11 +375,18 @@ def load_config() -> dict:
     except (TypeError, ValueError):
         attention = 25.0
     try:
-        turns = int(chat.get("history_turns", 6))
+        turns = int(chat.get("history_turns", 3))
     except (TypeError, ValueError):
-        turns = 6
+        turns = 3
     cfg["ai"]["chat"] = {"attention_sec": max(0.0, attention),
                          "history_turns": min(12, max(1, turns))}
+    # Новая секция режима разговоров: не затираем старый config.json.
+    talk = cfg["ai"].get("talk") if isinstance(cfg["ai"].get("talk"), dict) else {}
+    try:
+        auto_exit = float(talk.get("auto_exit_sec", 60))
+    except (TypeError, ValueError):
+        auto_exit = 60.0
+    cfg["ai"]["talk"] = {"auto_exit_sec": max(0.0, auto_exit)}
     return cfg
 
 
@@ -1125,6 +1135,7 @@ class State:
         self.stop = threading.Event()
         self.attention_until = 0.0  # до этого момента Джарвис «держит внимание» — имя можно не называть
         self.talk_mode = False  # режим разговора: без активатора, всё уходит нейросети
+        self.talk_last = 0.0    # время последней реплики в режиме разговора (для автовыхода по тишине)
         self.dictation_mode = False
         self.dictation_last_seen = 0.0
         self.dictation_buffer = ""
@@ -2429,6 +2440,54 @@ def cmd_forget(t):
     notify("Забыл разговор. Начнём заново?")
 
 
+def talk_auto_exit_sec() -> float:
+    """Через сколько секунд тишины авто-выход из режима разговора (0 — не выходить)."""
+    return float((CFG["ai"].get("talk") or {}).get("auto_exit_sec", 60) or 0)
+
+
+def talk_exit(announce: bool = True) -> None:
+    """Выйти из режима разговора: сбросить флаг, окно внимания и очередь аудио."""
+    STATE.talk_mode = False
+    STATE.talk_last = 0.0
+    STATE.attention_until = 0.0
+    # очищаем накопленный хвост фраз, сказанных уже после выхода
+    try:
+        while True:
+            audio_q.get_nowait()
+    except queue.Empty:
+        pass
+    if announce:
+        notify("Обычный режим. Реагирую на «Джарвис» и активатор из настроек.", force_speak=True)
+
+
+def _talk_control(text: str) -> bool:
+    """Управляющие фразы разговоров проверяются ПЕРВЫМИ — до нейросети и озвучки.
+
+    Возвращает True, если фраза переключила режим (вход/выход/пауза) и дальше
+    обрабатывать её не нужно: в паузе и вне разговора нейросеть не вызывается.
+    """
+    action, score = jarvis_routing.match_talk_control(text)
+    if not action:
+        return False
+    _stt_debug(f"управляющая фраза разговора: {action} ({score:.2f}) {text!r}")
+    if action == "enter":
+        if not STATE.talk_mode:
+            cmd_talk_mode(text)  # включит talk_mode и talk_last, скажет приветствие
+        return True
+    if action == "exit":
+        talk_exit() if STATE.talk_mode else cmd_talk_mode("обычный режим")
+        return True
+    if action == "pause":
+        # Пауза: выходим из разговора (токены/озвучка не тратим) и ждём возобновления.
+        STATE.listening = False
+        if STATE.talk_mode:
+            talk_exit(announce=False)
+        notify(f"Джарвис на паузе. Скажите «{CFG['phrases']['resume']}», чтобы возобновить.",
+               force_speak=True)
+        return True
+    return False
+
+
 def cmd_talk_mode(t):
     """«режим разговора» / «обычный режим» — свободная болтовня без активатора.
 
@@ -2439,6 +2498,7 @@ def cmd_talk_mode(t):
     off = any(s in t for s in ("выключ", "отключ", "обычн", "достаточно", "хватит"))
     STATE.talk_mode = not off
     STATE.attention_until = 0.0
+    STATE.talk_last = time.time() if STATE.talk_mode else 0.0
     if STATE.talk_mode:
         notify("Режим разговора включён. Можно просто говорить — я слушаю.", force_speak=True)
     else:
@@ -2609,7 +2669,9 @@ def ask_ai(question: str) -> None:
         try:
             if notifier:
                 notifier.show("Думаю…", True, 1500)
+            ASSISTANT.talk_mode = STATE.talk_mode  # в разговоре — короткие живые ответы
             answer = ASSISTANT.ask(question)  # ответ уходит и во всплывашку, и в голос
+            print(f"[ai] вопрос #{ASSISTANT.requests}: {question[:60]}")
             history_add("нейросеть", question, answer, ASSISTANT.last_tools)
             notify(answer)
         except jarvis_ai.AIError as e:
@@ -3617,6 +3679,28 @@ def _process_confirmation(text: str) -> None:
 
 def _process_inner(text: str, refined: bool = False) -> None:
     P = CFG["phrases"]
+    _TALK_FIRST_MARKER = text and not refined and _talk_control(text)
+    if _TALK_FIRST_MARKER:
+        return
+    if STATE.talk_mode:
+        STATE.talk_last = time.time()
+        # Режим разговора: управляющие фразы (вход/выход/пауза) уже обработаны выше,
+        # поэтому ЛЮБАЯ другая фраза без активатора уходит нейросети. Слой understand
+        # и таблицы команд НЕ должны её перехватывать: разговорный вопрос вроде
+        # «во что лучше поиграть» получал intent=launch/ignore и молча глох вместо
+        # ответа нейросети («в режиме разговора не реагировал»). Исключение — питание
+        # ПК: безопасность выше режима, «выключи пк» работает и здесь.
+        if not refined and text.strip():
+            power = jarvis_routing.power_intent(text)
+            if power:
+                {"shutdown": cmd_shutdown, "restart": cmd_restart,
+                 "cancel": cmd_cancel_shutdown, "sleep": cmd_power,
+                 "hibernate": cmd_power, "lock": cmd_power}[power](text)
+                jarvis_history.DISPATCH.set("команда", text, "выполнена")
+                return
+            if not jarvis_history.is_filler(text) and ai_ready():
+                ask_ai(ai_question(text))
+        return
     # Обращение к Джарвису считаем ДО слоя understand: иначе разговорные фразы
     # с активатором («Джарвис, расскажи анекдот») слой «ignore» молча отбрасывал
     # до того, как фраза доходила до нейросети («перестал отзываться»).
@@ -3647,10 +3731,22 @@ def _process_inner(text: str, refined: bool = False) -> None:
                 _slot_ask(decision.intent or "open", "Что вы имели в виду?")
                 return
             if decision.action == "confirm":
-                _process_confirmation(text)
-                return
+                # Средняя уверенность по команде закрытия/запуска НЕ «съедаем»
+                # заглушкой «Понял: выполню.» (она ничего не делала): проваливаемся
+                # к штатному диспетчеру ниже — он реально закроет окно, а при
+                # недостатке цели сам переспросит («Что закрыть?»). Иначе
+                # «джарвис закрой браузер» не закрывало ничего.
+                _stt_debug(f"confirm → штатное выполнение: {text!r} ({decision.reason})")
             if decision.action == "ignore":
-                _stt_debug(f"не понято (к Джарвису): {text!r}")
+                # Слабое совпадение КОМАНДЫ (есть кандидат-intent, но confidence мал):
+                # игнорируем молча и НЕ отдаём нейросети — иначе обрывки вроде
+                # «я бы говорил что он бесполезный» тратили бы токены.
+                # Если кандидата нет вовсе (intent=None) — это вопрос/шутка, она
+                # уходит ниже, где нейросеть ответит («расскажи анекдот»).
+                if decision.intent:
+                    _stt_debug(f"слабое совпадение команды, игнор: {text!r} ({decision.reason})")
+                    return
+                _stt_debug(f"не команда (к Джарвису), к нейросети: {text!r}")
         else:
             # Не адресовано: команды выполняются как раньше («открой ютуб» без
             # имени), фоновая болтовня молчит — лимит нейросети не тратим.
@@ -4009,33 +4105,39 @@ def listener_loop(ready: threading.Event) -> None:
                     tail -= 1
                     continue
                 state = vad.feed(_rms(chunk))
-                if state == "speech":
-                    if not collecting:
-                        collecting = True
-                        frames = list(prebuffer)  # предзапись: не режем первое слово
-                    prebuffer.clear()
-                    frames.append(chunk)
-                    if len(frames) >= max_frames:
+                if collecting:
+                    # Внутри фразы держим ВСЕ чанки — и речь, и тихие провалы между
+                    # слогами (feed возвращает None). Раньше None-чанки молча терялись,
+                    # и тихий хвост слова («ба-на-ны» → «ба») обрывал фразу: команда не
+                    # совпадала с первой попытки, приходилось повторять.
+                    if state == "silence":
+                        # конец фразы: 700 мс подряд ниже порога
                         collecting = False
                         pcm = b"".join(frames)
                         frames = []
-                        if len(pcm) > sample_rate:
+                        prebuffer.clear()
+                        if len(pcm) > sample_rate // 2:  # короче 0.5 с — шум
                             try:
                                 audio_q.put_nowait((pcm, sample_rate))
                             except queue.Full:
                                 pass
-                elif collecting and state == "silence":
-                    # конец фразы
-                    collecting = False
-                    pcm = b"".join(frames)
-                    frames = []
+                    else:
+                        frames.append(chunk)
+                        if len(frames) >= max_frames:
+                            collecting = False
+                            pcm = b"".join(frames)
+                            frames = []
+                            if len(pcm) > sample_rate:
+                                try:
+                                    audio_q.put_nowait((pcm, sample_rate))
+                                except queue.Full:
+                                    pass
+                elif state == "speech":
+                    collecting = True
+                    frames = list(prebuffer)  # предзапись: не режем первое слово
                     prebuffer.clear()
-                    if len(pcm) > sample_rate // 2:  # короче 0.5 с — шум
-                        try:
-                            audio_q.put_nowait((pcm, sample_rate))
-                        except queue.Full:
-                            pass
-                elif not collecting:
+                    frames.append(chunk)
+                else:  # не собираем, тишина — копим предзапись
                     prebuffer.append(chunk)
                     if len(prebuffer) > prebuffer_frames:
                         prebuffer.pop(0)
@@ -4066,6 +4168,14 @@ def main_loop() -> None:
             if STATE.dictation_mode and ju and ju.dictation_idle_expired(
                     STATE.dictation_last_seen, time.time(), CFG.get("dictation", {}).get("idle_timeout_sec", 120)):
                 _dictation_stop("Режим диктовки выключен: две минуты тишины.")
+            # Автовыход из режима разговора по тишине: если долго никто не говорил,
+            # выходим, чтобы Джарвис не молчал в talk_mode и не ждал вечно.
+            if STATE.talk_mode and STATE.talk_last:
+                idle = talk_auto_exit_sec()
+                if idle > 0 and time.time() - STATE.talk_last > idle:
+                    _stt_debug(f"автовыход из разговора: тишина {idle:.0f} с")
+                    talk_exit(announce=False)
+                    notify("Вы долго молчали — вышел из режима разговора.")
             continue
         if isinstance(item, tuple):
             pcm, rate = item
@@ -4251,8 +4361,14 @@ def main() -> None:
     notifier = Notifier()
     speaker = Speaker()
     if js:
-        HOTKEY = js.HotkeyListener(
-            lambda: process(CFG["phrases"]["pause"] if STATE.listening else CFG["phrases"]["resume"]),
+        def _hotkey_action() -> None:
+            # Горячая клавиша — надёжный неголосовой выход: в режиме разговора
+            # сначала выходим из него (хватит тратить токены), иначе — пауза/возобновление.
+            if STATE.talk_mode:
+                talk_exit()
+            else:
+                process(CFG["phrases"]["pause"] if STATE.listening else CFG["phrases"]["resume"])
+        HOTKEY = js.HotkeyListener(_hotkey_action,
             lambda message: notify(message, ok=False))
         HOTKEY.start(CFG.get("integrations", {}).get("hotkey", "ctrl+alt+j"))
 
