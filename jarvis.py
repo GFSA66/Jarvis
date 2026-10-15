@@ -191,7 +191,7 @@ YT_MUSIC_WINDOW_TITLE = "YouTube Music"
 DEFAULT_CONFIG = {
     "language": "ru-RU",
     "wake_word": {
-        "enabled": False,
+        "enabled": True,
         "word": "джарвис",
         "aliases": ["джервис", "джарвес", "жарвис", "джарви", "дарвис", "чарвис",
                     "джерри", "джерси", "jarvis"],
@@ -1219,7 +1219,7 @@ def _process_confirmation(text: str) -> bool:
         STATE.pending_confirm = None
         notify("Отменено.")
         return True
-    if not pending["password"] and is_word(text, "да", "давай", "подтверждаю"):
+    if not pending["password"] and is_word(text, "да", "ага", "подтверждаю", "согласен"):
         STATE.pending_confirm = None
         pending["on_yes"]()
         return True
@@ -1227,7 +1227,7 @@ def _process_confirmation(text: str) -> bool:
         STATE.pending_confirm = None
         pending["on_yes"]()
         return True
-    return True
+    return False
 
 
 def speakable(message: str) -> str:
@@ -2909,7 +2909,7 @@ def cmd_settings(t):
         root, CFG, save_user_config, AUTOSTART, jarvis_ai,
         say=lambda text: speaker.say(text) if speaker else None,
         history_read=_settings_history_read, history_clear=_settings_history_clear,
-        history_run=lambda text: threading.Thread(target=process, args=(_norm(text),), daemon=True).start(),
+        history_run=lambda text: threading.Thread(target=process, args=(_norm(text),), kwargs={"explicit": True}, daemon=True).start(),
         mic_test=mic_test))
 
 
@@ -3647,15 +3647,19 @@ def _flush_history() -> None:
         history_add(*entry)
 
 
-def process(text: str, refined: bool = False) -> None:
-    """Диспетчер: дедуп повторов, фильтры мусора, одна запись истории на запрос."""
+def process(text: str, refined: bool = False, explicit: bool = False) -> None:
+    """Диспетчер: дедуп повторов, фильтры мусора, одна запись истории на запрос.
+
+    explicit=True — явный ручной ввод (кнопка/история в настройках): фраза уже
+    адресована Джарвису, wake-слово и окно внимания не требуются.
+    """
     if not jarvis_history.DISPATCH.begin(text):
         return  # повторный захват того же аудио в пределах 3 с — уже выполнено
     if jarvis_history.is_hallucination(text):
         return  # галлюцинация STT («продолжение следует») — молча
     STATE.history_custom = None
     try:
-        _process_inner(text, refined)
+        _process_inner(text, refined, explicit)
     finally:
         _flush_history()
 
@@ -3665,19 +3669,7 @@ def _understanding_context() -> dict:
     return {"running": [], "windows": [], "folders": {}, "recent": []}
 
 
-def _process_confirmation(text: str) -> None:
-    """Подтверждение через нейросеть, если включена, иначе стандартный отклик."""
-    if CFG.get("understanding", {}).get("confirm_policy") == "ai" and jarvis_ai:
-        try:
-            if jarvis_ai and (CFG["ai"].get("enabled") or jarvis_ai.is_question(text)):
-                ask_ai(text)
-                return
-        except Exception:
-            log_error("confirm policy", None)
-    notify("Понял: выполню.", force_speak=True)
-
-
-def _process_inner(text: str, refined: bool = False) -> None:
+def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> None:
     P = CFG["phrases"]
     _TALK_FIRST_MARKER = text and not refined and _talk_control(text)
     if _TALK_FIRST_MARKER:
@@ -3717,7 +3709,7 @@ def _process_inner(text: str, refined: bool = False) -> None:
             text, str(_wake_cfg.get("word") or "джарвис"),
             jarvis_routing.WAKE_ALIASES + tuple(_wake_cfg.get("aliases") or ()),
             str(_wake_cfg.get("sensitivity") or "normal"))
-    addressed = named or attentive or wake_hit or STATE.talk_mode
+    addressed = named or attentive or wake_hit or STATE.talk_mode or explicit
     # Единый лексиконо-фонетический слой: для адресованной речи он решает,
     # выполнять, уточнить, подтвердить или игнорировать фразу, прежде чем
     # традиционные таблицы привлекают жёсткие искажения.
@@ -3763,7 +3755,7 @@ def _process_inner(text: str, refined: bool = False) -> None:
         STATE.pending_slot = None
         if time.time() <= slot_req.get("until", 0):
             verb = str(slot_req.get("verb") or "")
-            return _process_inner(f"{verb} {text}".strip(), refined=True)
+            return _process_inner(f"{verb} {text}".strip(), refined=True, explicit=explicit)
     if STATE.pending_clarify:
         opts, original = STATE.pending_clarify
         idx = jarvis_intents.clarify_choice(text, len(opts))
@@ -3776,8 +3768,10 @@ def _process_inner(text: str, refined: bool = False) -> None:
                 return
         # не разобрали ответ — обрабатываем как обычную фразу
     if STATE.pending_confirm:
-        _process_confirmation(text)
-        return
+        if _process_confirmation(text):
+            return
+        # не «да»/«нет» — pending остаётся ждать явного ответа, а текущую
+        # фразу обрабатываем как обычную команду (не глотаем молча).
     if STATE.dictation_mode:
         mode = ju.dictation_mode_detect(text) if ju else None
         if mode == "stop":
@@ -3895,7 +3889,8 @@ def _process_inner(text: str, refined: bool = False) -> None:
 
     # Локально ничего не понято: вопрос-рекомендация («во что поиграть, только не
     # киберпанк») уходит нейросети целиком — вместе с исключениями, без запуска игр.
-    if ai_ready() and jarvis_routing.is_recommendation(text):
+    # Только при обращении: фоновая болтовня без wake-слова токены не тратит.
+    if addressed and ai_ready() and jarvis_routing.is_recommendation(text):
         ask_ai(ai_question(text) or text)
         return
 
@@ -3907,7 +3902,7 @@ def _process_inner(text: str, refined: bool = False) -> None:
         fixed = refine_text(text)
         if fixed and fixed != text:
             print(f"Уточнено: {fixed}")
-            process(fixed, refined=True)
+            process(fixed, refined=True, explicit=explicit)
             return
 
     if ask:  # обратились по имени, но это не команда — пусть ответит нейросеть

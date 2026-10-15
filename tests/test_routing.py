@@ -131,3 +131,25 @@ def test_chain_not_split_for_questions_and_negations():
 def test_filler_phrases_are_not_recommendations():
     for phrase in ("ну", "давай", "так", "ага", "сначала хочу все-таки подделывать"):
         assert not routing.is_recommendation(phrase), phrase
+
+
+# --- управляющие фразы режима разговора ------------------------------------
+
+def test_talk_control_exit_with_verb_prefix():
+    for phrase in ("перейди в обычный режим", "закройся и перейди в обычный режим",
+                   "давай выйдем из разговора", "закрой разговор", "хватит болтать",
+                   "обычный режим"):
+        action, _score = routing.match_talk_control(phrase)
+        assert action == "exit", phrase
+
+
+def test_talk_control_no_false_positives():
+    for phrase in ("выход из квартиры", "давай поговорим о погоде"):
+        action, _score = routing.match_talk_control(phrase)
+        assert action == "", phrase
+
+
+def test_talk_control_enter():
+    for phrase in ("включи режим разговора", "режим разговора", "давай поболтаем"):
+        action, _score = routing.match_talk_control(phrase)
+        assert action == "enter", phrase
