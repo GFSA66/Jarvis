@@ -153,3 +153,9 @@ def test_talk_control_enter():
     for phrase in ("включи режим разговора", "режим разговора", "давай поболтаем"):
         action, _score = routing.match_talk_control(phrase)
         assert action == "enter", phrase
+
+
+def test_pogovorim_about_weather_is_not_talk_enter():
+    # «давай поговорим о погоде» — просьба рассказать, а не вход в talk-режим
+    action, _score = routing.match_talk_control("джарвис давай поговорим о погоде")
+    assert action == "", "поговорим о погоде"

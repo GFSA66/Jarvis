@@ -287,7 +287,7 @@ DEFAULT_CONFIG = {
         "files": True,                   # доступ к файлам ПК: чтение, создание, редактирование
         "self_edit": True,               # нейросеть может редактировать файлы самого Джарвиса
         "refine": False,                 # додумывать непонятые фразы нейросетью — только последний запасной шаг (по умолчанию выключено)
-        "chat": {"attention_sec": 25, "history_turns": 3},  # диалог: сколько секунд помнить обращение без имени
+        "chat": {"attention_sec": 10, "history_turns": 3},  # диалог: сколько секунд помнить обращение без имени
         # Режим разговоров (talk_mode): подхват любых фраз без активатора.
         # auto_exit_sec — автовыход по тишине; 0 — не выходить автоматически.
         "talk": {"auto_exit_sec": 60},
@@ -371,9 +371,9 @@ def load_config() -> dict:
         hud["theme"] = "jarvis_blue"
     chat = cfg["ai"].get("chat") or {}
     try:
-        attention = float(chat.get("attention_sec", 25))
+        attention = float(chat.get("attention_sec", 10))
     except (TypeError, ValueError):
-        attention = 25.0
+        attention = 10.0
     try:
         turns = int(chat.get("history_turns", 3))
     except (TypeError, ValueError):
@@ -3424,7 +3424,7 @@ COMMANDS = [
     Cmd(lambda t: has(t, "напомни"), cmd_remind, False),        # напомни мне …
     Cmd(lambda t: is_word(t, "голос"), cmd_voice, False),
     Cmd(lambda t: has(t, "забудь", "забыть") or has(t, "новый разговор"), cmd_forget, False),
-    Cmd(lambda t: has(t, "режим разговора", "режим болтовни") or has(t, "болтаем", "поговорим")
+    Cmd(lambda t: has(t, "режим разговора", "режим болтовни", "режим диалога", "режим общения")
         or (has(t, "обычный режим", "режим команд") and has(t, "включ", "переключ", "верн")),
         cmd_talk_mode, False),
     Cmd(lambda t: has(t, "выключ режим разговора", "отключ режим разговора",
@@ -3809,7 +3809,7 @@ def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> 
             # Одиночное обращение «Джарвис»: открываем окно внимания и коротко
             # отвечаем — следующая команда уже не потребует wake-слова.
             if not text or jarvis_history.is_filler(text):
-                window = (CFG["ai"].get("chat") or {}).get("attention_sec", 25)
+                window = (CFG["ai"].get("chat") or {}).get("attention_sec", 10)
                 STATE.attention_until = time.time() + max(0.0, window)
                 notify("Да, господин. Слушаю.")
                 return
@@ -3831,10 +3831,11 @@ def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> 
     # и не отправляются в нейросеть — молча.
     if addressed and jarvis_history.is_filler(text):
         return
-    # Окно внимания обновляем при любом обращении (в том числе офлайн, без ИИ),
-    # чтобы следующие команды без wake-слова тоже доходили.
-    if addressed:
-        window = (CFG["ai"].get("chat") or {}).get("attention_sec", 25)
+    # Окно внимания продлеваем только на явное обращение (wake/имя/ручной ввод):
+    # иначе каждая адресованная фраза сама себе продлевала +25 сек, и окно
+    # держалось бесконечно — Джарвис отвечал на чужую речь рядом.
+    if named or wake_hit or explicit:
+        window = (CFG["ai"].get("chat") or {}).get("attention_sec", 10)
         STATE.attention_until = time.time() + max(0.0, window)
     ask = ai_question(text) if addressed and ai_ready() else None
 
