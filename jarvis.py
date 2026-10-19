@@ -443,7 +443,9 @@ def save_user_config(patch: dict) -> None:
             shutil.copy2(path, path.with_suffix(".json.bak"))  # битый файл не теряем
             data = {}
     for k, v in patch.items():
-        if (k in _MERGE_KEYS or isinstance(v, dict)) and isinstance(data.get(k), dict) and isinstance(v, dict):
+        if k in REPLACE_KEYS:
+            data[k] = copy.deepcopy(v) if isinstance(v, (dict, list)) else v
+        elif (k in _MERGE_KEYS or isinstance(v, dict)) and isinstance(data.get(k), dict) and isinstance(v, dict):
             data[k].update(v)
         else:
             data[k] = v
@@ -1145,6 +1147,7 @@ class State:
         self.history_custom: tuple | None = None  # своя запись истории от текущей команды
         self.pending_clarify: tuple | None = None  # (opts, исходная фраза) при переспросе
         self.pending_slot: dict | None = None  # ожидание слота: {verb, until}
+        self.pending_open: dict | None = None  # выбор файла: {paths, until}
 
 
 def _slot_ask(verb: str, question: str) -> None:
@@ -1546,7 +1549,7 @@ def split_chain(text: str) -> list:
         return [stripped]
     if re.search(r"\b(?:удали|удалить|убери|сотри|стереть)\b", stripped):
         return [stripped]
-    if re.search(r"\b(?:надиктуй|диктуй|диктовка|напечатай|набери|вставь)\b", stripped):
+    if re.search(r"\b(?:надиктуй|диктуй|диктовка|напечатай|набери|вставь|напиши)\b", stripped):
         return [stripped]
     parts = [p.strip(" ,.!?-—") for p in CHAIN_SPLIT_RE.split(stripped)]
     return [p for p in parts if p]
@@ -1829,7 +1832,8 @@ def parse_create(t: str):
 # ----- открытие файлов и папок ----------------------------------------------
 
 _OPEN_ITEM = re.compile(r"\b(?:файл\w*|папк\w*|документ\w*|директори\w*|каталог\w*|изображени\w*|"
-                        r"картин\w*|фото|текст\w*)\b")
+                        r"картин\w*|фото|текст\w*|загруз\w*|рабоч\w*\s+стол\w*|стол\w*|"
+                        r"документ\w*|downloads?)\b")
 _OPEN_PATH = re.compile(r"(?:[a-zA-Z]:[\\/]|~[\\/]|\\\\)[\w .\\/-]+")
 
 
@@ -1841,6 +1845,18 @@ def wants_open_item(t: str) -> bool:
 
 
 def cmd_open(t):
+    # системные папки — сразу, без нейросети: «открой загрузки/рабочий стол/документы»
+    for stem, key in _FOLDER_STEMS:
+        if stem in t:
+            p = Path(user_folders().get(key) or (Path.home() / "Desktop"))
+            try:
+                os.startfile(str(p))
+                notify(f"Открыл: {p}")
+                return
+            except OSError as e:
+                log_error("Открытие папки", e)
+                notify(f"Не получилось открыть {p}: {e}", ok=False)
+                return
     m = _OPEN_PATH.search(t)
     if m:
         p = Path(os.path.expandvars(os.path.expanduser(m.group(0).strip().strip("\"'"))))
@@ -1851,6 +1867,34 @@ def cmd_open(t):
                 return
             except OSError as e:
                 log_error("Открытие файла", e)
+    # локальный поиск по имени — без нейросети: «открой файл овт 7» находит
+    # OBT7.pdf/OBT7.docx на рабочем столе, в загрузках, документах и т.д.
+    m = re.search(r"\b(?:файл\w*|папк\w*|документ\w*|директори\w*|каталог\w*)\s+"
+                  r"(?:с\s+именем\s+|под\s+названием\s+)?(.+?)(?=$|[.,!?])", t)
+    name = (m.group(1) if m else "").strip().strip("\"'«»")
+    name = re.sub(r"\b(пожалуйста|на рабочем столе|в загрузках|в документах)\b", "", name).strip()
+    if name:
+        is_dir_word = bool(re.search(r"\b(?:папк\w*|директори\w*|каталог\w*)\b", t))
+        cands = _find_delete_candidates(name, _create_dest(t), is_dir_word)
+        if len(cands) == 1:
+            try:
+                os.startfile(str(cands[0]))
+                notify(f"Открыл: {cands[0]}")
+                return
+            except OSError as e:
+                log_error("Открытие файла", e)
+                notify(f"Не получилось открыть {cands[0]}: {e}", ok=False)
+                return
+        if len(cands) > 1:
+            names = ", ".join(p.name for p in cands[:5])
+            STATE.pending_open = {"paths": [str(p) for p in cands[:5]],
+                                  "until": time.time() + 15.0}
+            notify(f"Нашёл несколько «{name}»: {names} — скажи «первая», «вторая» или номер.",
+                   ok=False)
+            return
+        # локально не нашли, имя есть — честно говорим, а не «Что вы имели в виду?»
+        notify(f"Не нашёл файл «{name}» на рабочем столе, в загрузках и документах.", ok=False)
+        return
     if ai_ready():
         ask_ai(ai_question(t) or t)  # нейросеть найдёт по имени (find_any) и откроет (open_path)
     else:
@@ -1876,6 +1920,71 @@ def _norm_name(s: str) -> str:
     s = re.sub(r"[_\-]+", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
+_FILE_EXT_WORDS = {"pdf", "пдф", "docx", "doc", "документ", "ворд",
+                   "xlsx", "эксель", "таблица", "txt", "текст", "pptx",
+                   "презентация", "jpg", "jpeg", "png", "картинка", "фото",
+                   "mp3", "музыка", "песня", "mp4", "видео", "zip", "архив"}
+
+
+def _strip_ext_words(s: str) -> str:
+    """Убрать слова-расширения из голосового запроса: «лр1 pdf» -> «лр1»."""
+    toks = [w for w in _norm_name(s).split() if w not in _FILE_EXT_WORDS]
+    return " ".join(toks)
+
+
+def _norm_name_variants(s: str) -> set[str]:
+    """Варианты имени для голосового поиска: кириллица + транслит в латиницу.
+
+    «овт 7» (как слышит STT) должен совпасть с файлом OBT7.pdf/OBT7.docx.
+    """
+    base = _norm_name(s)
+    if not base:
+        return set()
+    # «лр1 pdf» -> «лр1»: расширение словами отбрасываем
+    short = _strip_ext_words(s)
+    out = {base, base.replace(" ", "")}
+    if short and short != base:
+        out.add(short)
+        out.add(short.replace(" ", ""))
+    try:
+        lat = jarvis_understand.cyrillic_to_latin(base)
+    except Exception:
+        lat = base
+    out.add(lat)
+    out.add(lat.replace(" ", ""))
+    for v in list(out):
+        out.add(re.sub(r"(?<=[a-zа-я])(?=\d)|(?<=\d)(?=[a-zа-я])", " ", v).strip())
+    return {v for v in out if v}
+
+
+def _names_match(want_variants: set[str], norm: str) -> bool:
+    norm_nospace = norm.replace(" ", "")
+    for w in want_variants:
+        if not w:
+            continue
+        if w == norm or w in norm or norm in w:
+            return True
+        if w.replace(" ", "") == norm_nospace:
+            return True
+    # фонетика — только для коротких имён с цифрой («овт 7» vs «OBT7»):
+    # STT путает звонкие/глухие (в→b), сходство ~0.62 — ниже общего порога,
+    # но для «буквы+цифра» это нормально. Длинные слова так не сравниваем,
+    # иначе «отчёт» совпадёт с чем угодно.
+    try:
+        for w in want_variants:
+            wn = w.replace(" ", "")
+            if not wn or len(wn) > 8:
+                continue
+            if not (any(c.isdigit() for c in wn) and any(c.isalpha() for c in wn)):
+                continue
+            if (jarvis_understand.phonetic_similarity(w, norm) >= 0.55
+                    or jarvis_understand.phonetic_similarity(wn, norm_nospace) >= 0.55):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 
 def _find_delete_candidates(name: str, dest: Path, want_dir: bool) -> list:
     """Кандидаты на удаление: точное имя, затем нечёткий поиск рядом.
@@ -1885,6 +1994,7 @@ def _find_delete_candidates(name: str, dest: Path, want_dir: bool) -> list:
     загрузки) — полный обход всего ПК тут не нужен и может висеть минутами.
     """
     want = _norm_name(name)
+    variants = _norm_name_variants(name)
     exact = dest / name
     if exact.exists():
         if want_dir and not exact.is_dir():
@@ -1905,7 +2015,7 @@ def _find_delete_candidates(name: str, dest: Path, want_dir: bool) -> list:
                 if want_dir and not p.is_dir():
                     continue
                 norm = _norm_name(p.name)
-                if want == norm or want in norm or norm in want:
+                if _names_match(variants, norm):
                     seen.add(str(p))
                     cands.append(p)
                     if len(cands) >= 5:
@@ -2054,7 +2164,7 @@ def cmd_dictate(t):
     paste_delay (пауза перед Ctrl+V — медленным окнам нужно больше),
     restore_clipboard (вернуть старый буфер после вставки).
     """
-    m = re.search(r"\b(?:надиктуй|диктуй|диктовка|напечатай|набери|вставь)\b\s*(.*)", t)
+    m = re.search(r"\b(?:надиктуй|диктуй|диктовка|напечатай|набери|вставь|напиши)\b\s*(.*)", t)
     raw = (m.group(1) if m else "").strip()
     if not raw:
         notify("Что напечатать? Скажи: «надиктуй привет точка как дела вопрос».", ok=False)
@@ -3141,6 +3251,13 @@ def cmd_todo(t):
     if has(t, "очисти выполн"):
         confirm("очистка выполненных дел", "Удалить выполненные дела?", lambda: (_todo_save(ju.todo_clear_done(rows)), notify("Выполненные дела очищены.")))
         return
+    if has(t, "удали", "удалить", "убери", "вычеркни") and has(t, "дел", "задач"):
+        selector = re.sub(r".*?(?:удали(?:ть)?|убери|вычеркни)\s*(?:из\s+списка\s+дел\s*)?", "", t).strip()
+        selector = re.sub(r"^(?:дело|задачу|задача|пункт)\s*(?:номер|№)?\s*", "", selector).strip()
+        new, hit = ju.todo_remove(rows, selector)
+        if hit: _todo_save(new); journal_add("удаление дела", {"kind": "todo_restore", "rows": rows}, True); notify(f"Удалил: {hit}.")
+        else: notify("Не нашёл такое дело.", ok=False)
+        return
     if has(t, "отмет", "выполнен"):
         selector = re.sub(r".*?(?:выполненным|выполнено|отметь)\s*", "", t).strip()
         new, hit = ju.todo_done(rows, selector)
@@ -3336,8 +3453,21 @@ def _dictation_feed(text: str) -> None:
         notify(js.ELEVATED_HINT, ok=False); return
     typed, new_buffer, delete = ju.apply_dictation_commands(
         text, STATE.dictation_buffer, bool(dc.get("autoformat", True)))
+    # STT-дубль: та же фраза пришла дважды подряд (эхо микрофона) — не печатаем
+    # второй раз, иначе «запятая привет» давало «,, привет».
+    if typed and not delete and STATE.dictation_last_chunk and typed == STATE.dictation_last_chunk:
+        STATE.dictation_last_seen = time.time()
+        STATE.dictation_last_chunk = ""
+        return
     STATE.dictation_buffer = new_buffer
     STATE.dictation_last_seen = time.time()
+    if delete and not typed:
+        # удаление — сообщаем, иначе кажется что «сотри» молча глохнет
+        js.type_text("\b" * delete, "unicode", int(dc.get("char_delay_ms", 8)))
+        notify(f"Стер последнее ({delete} симв.).")
+        STATE.dictation_last_chunk = ""
+        STATE.history_custom = ("диктовка", "удаление последнего", "стерто")
+        return
     if delete:
         js.type_text("\b" * delete, "unicode", int(dc.get("char_delay_ms", 8)))
     if typed:
@@ -3346,6 +3476,11 @@ def _dictation_feed(text: str) -> None:
                      callback=lambda e: notify(f"Не получилось: {e}", ok=False) if e else None)
         # одна запись на фразу — через диспетчер (см. process)
         STATE.history_custom = ("диктовка", f"диктовка, {len(typed)} символов", "введено")
+        return
+    # ни ввода ни удаления (обрывок STT вроде «на», «нади», «алло») — не молчим,
+    # иначе кажется что диктовка «не работает»
+    STATE.dictation_last_chunk = ""
+    notify(f"Не расслышал для диктовки: «{text}». Повтори чётче.", ok=False)
 
 
 def U(key):  # ссылка из config.urls
@@ -3385,7 +3520,8 @@ COMMANDS = [
     Cmd(lambda t: has(t, "брос", "кин", "бросок") and ("d" in t or "д" in t or has(t, "куб", "кост")), cmd_dice, False),
     Cmd(lambda t: has(t, "подбрось монет", "монетк"), cmd_dice, False),
     Cmd(lambda t: has(t, "список дел") or has(t, "добав") and has(t, "список")
-                  or has(t, "очисти выполн") or has(t, "отметь выполн"), cmd_todo, False),
+                  or has(t, "очисти выполн") or has(t, "отметь выполн")
+                  or (has(t, "удали", "убери", "вычеркни") and has(t, "дел", "задач")), cmd_todo, False),
     Cmd(lambda t: has(t, "таймер", "будильник", "секундомер", "засеки", "сколько осталось")
                   or has(t, "отмени таймер"), cmd_timer, False),
     Cmd(lambda t: has(t, "переключи звук") and has(t, "наушник", "колонк"), cmd_output, False),
@@ -3414,7 +3550,7 @@ COMMANDS = [
         cmd_delete, False),
     # диктовка — раньше «найди» и раньше нейронки: «напечатай …» вставляет, а не гуглит/спрашивает
     Cmd(lambda t: bool(re.search(r"\b(?:надиктуй|диктуй|диктовка|напечатай|напечать|"
-                                 r"набери|набрать|вставь|вставить|продиктуй)\b", t)),
+                                 r"набери|набрать|вставь|вставить|продиктуй|напиши)\b", t)),
         cmd_dictate, False),
     # «открой файл / папку / документ» — не сайт, а файл; раньше игр, «учеб» и «открой-сайт»
     Cmd(wants_open_item, cmd_open, False),
@@ -3507,12 +3643,12 @@ INTENTS: list[Intent] = [
     Intent("reminders", ("покажи напоминания", "очисти напоминания", "удали напоминания"), 52),
     Intent("remind", (), 53, pattern=r"\bнапомни\b"),
     Intent("todo", ("список дел", "добавь в список дел", "очисти выполненные",
-                    "отметь выполненным"), 54),
+                    "отметь выполненным", "удали из списка дел"), 54),
     Intent("timer", ("таймер", "будильник", "засеки", "сколько осталось",
                      "отмени таймер", "секундомер"), 55),
     Intent("dictate", ("режим диктовки", "диктуй"), 56,
            pattern=r"\b(?:надиктуй|диктуй|диктовка|напечатай|напечать|набери|набрать|"
-                   r"вставь|вставить|продиктуй)\b"),
+                   r"вставь|вставить|продиктуй|напиши)\b"),
     # игры-броски, буфер обмена
     Intent("dice", (), 58,
            pattern=r"\b(?:брос|кин|бросок)\w*\s+.*(?:\bd\d|\bд\d|куб|кост)|подбрось монет"),
@@ -3666,7 +3802,41 @@ def process(text: str, refined: bool = False, explicit: bool = False) -> None:
 
 def _understanding_context() -> dict:
     """Снимок системы для лексикона: безопасные «голые» значения по умолчанию."""
-    return {"running": [], "windows": [], "folders": {}, "recent": []}
+    ctx = {"running": [], "windows": [], "folders": {}, "recent": [], "files": []}
+    try:
+        seen = set()
+        roots = []
+        for _stem, key in _FOLDER_STEMS:
+            try:
+                root = Path(user_folders().get(key) or "")
+            except Exception:
+                continue
+            if root and root.is_dir() and str(root) not in [str(r) for r in roots]:
+                roots.append(root)
+        # Документы/загрузки/рабочий стол — первыми: там лежат файлы пользователя
+        # (ОВТ7, ЛР1). Картинки/музыка/видео — после: там сотни файлов.
+        prio = ("документы", "загрузки", "рабочий стол")
+        ordered = sorted(roots, key=lambda r: (
+            next((i for i, k in enumerate(prio)
+                  if str(r) == str(user_folders().get(k))), 99)))
+        for root in ordered:
+            try:
+                for p in root.iterdir():
+                    n = p.name
+                    if n.startswith(".") or n.startswith("~$"):
+                        continue
+                    nl = n.lower()
+                    if nl in seen:
+                        continue
+                    seen.add(nl)
+                    ctx["files"].append(n)
+                    if len(ctx["files"]) >= 400:
+                        return ctx
+            except OSError:
+                continue
+    except Exception:
+        pass
+    return ctx
 
 
 def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> None:
@@ -3674,6 +3844,17 @@ def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> 
     _TALK_FIRST_MARKER = text and not refined and _talk_control(text)
     if _TALK_FIRST_MARKER:
         return
+    # Режим диктовки — раньше слоя understand: короткие фразы («сотри», «на»,
+    # «алло», одиночное «джарвис») understand резал как «слабое совпадение»
+    # и они молча глохли до диктовки («не работает»).
+    if STATE.dictation_mode and not refined:
+        mode = ju.dictation_mode_detect(text) if ju else None
+        if mode == "stop":
+            _dictation_stop()
+            return
+        if ju and ju.is_dictation_text(True, text):
+            _dictation_feed(text)
+            return
     if STATE.talk_mode:
         STATE.talk_last = time.time()
         # Режим разговора: управляющие фразы (вход/выход/пауза) уже обработаны выше,
@@ -3692,6 +3873,48 @@ def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> 
                 return
             if not jarvis_history.is_filler(text) and ai_ready():
                 ask_ai(ai_question(text))
+        return
+    # Выбор файла после списка: «Нашёл несколько…» → «первая/вторая/1/2».
+    # Раньше understand — иначе «первая» уходит в нейросеть (find_any).
+    # Wake-слово/имя вырезаем здесь: на этом этапе оно ещё не снято.
+    if STATE.pending_open and not refined:
+        req = STATE.pending_open
+        STATE.pending_open = None
+        if time.time() <= req.get("until", 0):
+            sel = text
+            _wc = CFG["wake_word"]
+            if _wc.get("enabled"):
+                _found, _rest = jarvis_routing.find_wake(
+                    sel, str(_wc.get("word") or "джарвис"),
+                    jarvis_routing.WAKE_ALIASES + tuple(_wc.get("aliases") or ()),
+                    str(_wc.get("sensitivity") or "normal"))
+                if _found and _rest:
+                    sel = _rest
+            else:
+                for n in CFG["ai"]["names"]:
+                    sel = sel.replace(n, "")
+            sel = sel.strip(" ,.!?—-") or text
+            idx = jarvis_intents.clarify_choice(sel, len(req.get("paths", [])))
+            paths = req.get("paths", [])
+            if idx is not None and 0 <= idx < len(paths):
+                try:
+                    os.startfile(paths[idx])
+                    notify(f"Открыл: {paths[idx]}")
+                except OSError as e:
+                    log_error("Открытие файла", e)
+                    notify(f"Не получилось открыть: {e}", ok=False)
+                jarvis_history.DISPATCH.set("команда", text, "файл открыт")
+                return
+            # не разобрали выбор — пробуем сказанное как имя нового файла
+            cmd_open(sel)
+            jarvis_history.DISPATCH.set(*(STATE.history_custom or ("команда", text, "выполнена")))
+            return
+    # «открой файл/папку …» — сразу в локальный поиск, минуя слой understand:
+    # understand не знает реальных имён файлов и всегда давал clarify
+    # («Что вы имели в виду?») вместо открытия.
+    if not refined and wants_open_item(text):
+        cmd_open(text)
+        jarvis_history.DISPATCH.set(*(STATE.history_custom or ("команда", text, "выполнена")))
         return
     # Обращение к Джарвису считаем ДО слоя understand: иначе разговорные фразы
     # с активатором («Джарвис, расскажи анекдот») слой «ignore» молча отбрасывал
@@ -3773,13 +3996,8 @@ def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> 
         # не «да»/«нет» — pending остаётся ждать явного ответа, а текущую
         # фразу обрабатываем как обычную команду (не глотаем молча).
     if STATE.dictation_mode:
-        mode = ju.dictation_mode_detect(text) if ju else None
-        if mode == "stop":
-            _dictation_stop()
-            return
-        if ju and ju.is_dictation_text(True, text):
-            _dictation_feed(text)
-            return
+        # уже обработано в начале _process_inner (до слоя understand)
+        return
     elif ju and ju.dictation_mode_detect(text) == "start":
         STATE.dictation_mode = True
         STATE.dictation_last_seen = time.time()
@@ -3865,7 +4083,7 @@ def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> 
     # НО: диктовка («напечатай …») и удаление («удали файл …») — всегда локальные команды,
     # даже если сказаны с обращением «Джарвис»: иначе «напечатай в телеграм» уходит нейронке.
     _local_first = re.search(r"\b(?:надиктуй|диктуй|диктовка|напечатай|напечать|"
-                             r"набери|набрать|вставь|вставить|продиктуй)\b", text)
+                             r"набери|набрать|вставь|вставить|продиктуй|напиши)\b", text)
     if _local_first:
         for cmd in COMMANDS:
             if cmd.run is cmd_dictate and cmd.match(text):

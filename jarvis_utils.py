@@ -152,6 +152,7 @@ DICTATION_MARKS: tuple[tuple[str, str], ...] = (
     ("вопросительный знак", "?"),
     ("точка с запятой", ";"),
     ("многоточие", "..."),
+    ("троеточие", "..."),
     ("открывающая кавычка", "«"),
     ("закрывающая кавычка", "»"),
     ("открывается скобка", "("),
@@ -173,7 +174,14 @@ DICTATION_MARKS: tuple[tuple[str, str], ...] = (
 )
 # команды-правки (не вставляют текст, а меняют уже введённое)
 DICTATION_DELETE_LAST_WORD = ("удали последнее слово", "сотри последнее слово",
-                              "убери последнее слово", "удали слово")
+                              "убери последнее слово", "удали слово",
+                              "сотри последнее", "удали последнее",
+                              "сотри слово", "убери слово",
+                              "сотри", "удали слово последнее",
+                              # короткие обрывки STT: «сотри последняя», «нади», «на»
+                              "сотри последняя", "сотри последний",
+                              "удали последняя", "удали последний",
+                              "последнее слово сотри", "последнее слово удали")
 DICTATION_DELETE_LAST_SENTENCE = ("удали последнюю фразу", "сотри последнюю фразу",
                                  "удали фразу", "убери последнюю фразу")
 DICTATION_CANCEL = ("отмени ввод", "отменить ввод", "сотри всё", "очисти ввод")
@@ -214,8 +222,11 @@ def apply_dictation_commands(text: str, buffer: str = "",
     # отмена всего введённого
     if low in DICTATION_CANCEL:
         return "", "", len(buffer)
-    # удаление последнего слова
-    if any(low.startswith(c) for c in DICTATION_DELETE_LAST_WORD):
+    # удаление последнего слова — также короткие формы: «сотри», «удали последнее»
+    # (STT часто режет фразу: «сотри последняя», «сотри последнее слово» без
+    # окончания; обрывки «нади»/«на» не трогаем — они могут быть началом слов)
+    if any(low == c or low.startswith(c + " ") or c.startswith(low + " ")
+           for c in DICTATION_DELETE_LAST_WORD if len(low) >= 5):
         stripped = buffer.rstrip()
         if stripped:
             last = stripped.rsplit(" ", 1)[-1]
@@ -476,6 +487,26 @@ def todo_done(todos: list, selector: str) -> tuple[list, str | None]:
 
 def todo_clear_done(todos: list) -> list:
     return [r for r in todos if not r.get("done")]
+
+
+def todo_remove(todos: list, selector: str) -> tuple[list, str | None]:
+    """Удалить дело по номеру («2») или по тексту.
+    -> (новый список, удалённый текст|None)."""
+    sel = (selector or "").strip().lower().replace("ё", "е")
+    if not sel:
+        return list(todos), None
+    rows = list(todos)
+    if sel.isdigit():
+        idx = int(sel) - 1
+        if 0 <= idx < len(rows):
+            hit = rows.pop(idx)
+            return rows, str(hit.get("text", ""))
+        return rows, None
+    for i, row in enumerate(rows):
+        if sel in str(row.get("text", "")).lower().replace("ё", "е"):
+            hit = rows.pop(i)
+            return rows, str(hit.get("text", ""))
+    return rows, None
 
 
 def todo_text(todos: list) -> str:

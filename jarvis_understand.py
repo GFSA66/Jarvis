@@ -213,7 +213,7 @@ DEFAULT_VERBS: dict[str, tuple[str, ...]] = {
 }
 _ACTION_KINDS = {
     "close": frozenset({"app", "game", "window"}),
-    "open": frozenset({"app", "site", "folder", "command", "game"}),
+    "open": frozenset({"app", "site", "folder", "command", "game", "file"}),
     "launch": frozenset({"app", "game", "command"}),
     "search": frozenset({"site", "folder", "command"}),
 }
@@ -294,6 +294,9 @@ def build_lexicon(cfg: dict | None = None, context: dict | None = None) -> Lexic
     for name, path in (context.get("folders") or {}).items():
         if path:
             add(f"folder:{normalize(name)}", str(name), "folder", ("open", "search"), str(path))
+    for name in context.get("files") or []:
+        if name:
+            add(f"file:{normalize(str(name))}", str(name), "file", ("open",))
     for title in context.get("windows") or []:
         if title:
             add(f"window:{normalize(str(title))}", str(title), "window", ("close",))

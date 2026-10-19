@@ -113,6 +113,29 @@ def test_dictation_idle_timeout():
     assert not u.dictation_idle_expired(now - 9999, now, 0)  # 0 — выключено
 
 
+def test_dictation_short_delete_forms():
+    # короткие/урезанные STT формы «сотри» — тоже удаление, а не текст
+    for phrase in ("сотри", "сотри последнее", "сотри последняя",
+                   "удали последнее", "удали последняя"):
+        _t, buf, delete = u.apply_dictation_commands(phrase, "привет мир")
+        assert delete > 0, phrase
+        assert buf == "привет ", phrase
+    # обрывки «на»/«нади» — не удаление (могут быть началом слов);
+    # буфер берём как в реальной диктовке — с заглавной, иначе автоформат
+    # перепишет его целиком и delete будет равен len(buffer)
+    for phrase in ("на", "нади"):
+        _t, buf, delete = u.apply_dictation_commands(phrase, "Привет мир")
+        assert delete == 0, phrase
+        assert phrase in buf.lower(), phrase
+
+
+def test_dictation_single_mark_with_empty_buffer():
+    # одиночный «запятая» при пустом буфере — знак, а не пустота
+    typed, buf, delete = u.apply_dictation_commands("запятая привет", "")
+    assert "," in buf and "ривет" in buf
+    assert delete == 0
+
+
 # --- кубики -------------------------------------------------------------------
 
 def test_roll_dice_d20():
@@ -234,6 +257,22 @@ def test_todo_done_missing():
     todos = u.todo_add([], "купить хлеб")
     _t, hit = u.todo_done(todos, "9")
     assert hit is None
+
+
+def test_todo_remove_by_number():
+    todos = u.todo_add([], "купить молоко")
+    todos = u.todo_add(todos, "позвонить маме")
+    todos, hit = u.todo_remove(todos, "1")
+    assert hit == "купить молоко"
+    assert len(todos) == 1 and todos[0]["text"] == "позвонить маме"
+
+
+def test_todo_remove_by_text_and_missing():
+    todos = u.todo_add([], "купить хлеб")
+    todos, hit = u.todo_remove(todos, "хлеб")
+    assert hit == "купить хлеб" and todos == []
+    _t, miss = u.todo_remove(u.todo_add([], "купить хлеб"), "молоко")
+    assert miss is None
 
 
 def test_notes_logic():

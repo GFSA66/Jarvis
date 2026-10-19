@@ -88,16 +88,21 @@ def tie_options(hits: list[Hit], limit: int = 2) -> list[str]:
             if h.intent.priority == pri and h.score == best][:limit]
 
 
-# Обработка ответа на переспрос: «первая», «вторая», «второе», «1», «2»
+# Обработка ответа на переспрос: «первая», «вторая», «третья», «1», «2», «3»…
 _FIRST_WORDS = {"первая", "первой", "первое", "первый", "1", "один", "одна"}
 _SECOND_WORDS = {"вторая", "второй", "второе", "2", "два", "две"}
+_THIRD_WORDS = {"третья", "третьей", "третье", "третий", "3", "три"}
+_FOURTH_WORDS = {"четвёртая", "четвертая", "четвёртой", "четвертой",
+                 "четвёртое", "четвертое", "четвёртый", "четвертый", "4", "четыре"}
+_FIFTH_WORDS = {"пятая", "пятой", "пятое", "пятый", "5", "пять"}
+
+_ORDINAL_GROUPS = (_FIRST_WORDS, _SECOND_WORDS, _THIRD_WORDS, _FOURTH_WORDS, _FIFTH_WORDS)
 
 
 def clarify_choice(text: str, limit: int = 2) -> int | None:
-    """Индекс выбранной опции (0-based) по ответу «первая/вторая», иначе None."""
+    """Индекс выбранного варианта (0-based) по ответу «первая/вторая/…», иначе None."""
     t = normalize(text)
-    if t in _FIRST_WORDS:
-        return 0
-    if limit >= 2 and t in _SECOND_WORDS:
-        return 1
+    for i, group in enumerate(_ORDINAL_GROUPS[:limit]):
+        if t in group:
+            return i
     return None
