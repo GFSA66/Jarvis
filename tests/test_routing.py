@@ -99,6 +99,24 @@ def test_close_verb_exact_forms_only():
     assert not routing.close_verb("открой блокнот")
 
 
+def test_close_verb_recognizes_all_close_forms():
+    for phrase in ("закрой телеграм", "выключи телеграм", "заверши телеграм",
+                   "останови телеграм", "выключить телеграм", "закрыть телеграм",
+                   "закрой стим", "выключи браузер"):
+        assert routing.close_verb(phrase), phrase
+    assert not routing.close_verb("закройщик смены")
+    assert not routing.close_verb("открой телеграм")
+    assert not routing.close_verb("включи музыку")
+
+
+def test_resolve_close_telegram_variants():
+    for phrase in ("закрой телеграм", "выключи телеграм", "заверши телеграм",
+                   "останови телеграм"):
+        req = routing.resolve_close(phrase)
+        assert req["kind"] == "app", phrase
+        assert req["target"] == "телеграм", phrase
+
+
 # --- отрицания и рекомендации ----------------------------------------------
 
 def test_negation_blocks_launches():

@@ -83,3 +83,13 @@ def test_generated_coverage_has_all_actionable_entries():
     for entry in _lexicon().entries:
         for action in entry.actions & {"open", "launch", "close", "search"}:
             assert (action, entry.id) in covered
+
+
+def test_close_verbs_include_switch_off():
+    lexicon = _lexicon()
+    for phrase in ("закрой телеграм", "выключи телеграм", "заверши телеграм",
+                   "останови телеграм", "выключить телеграм"):
+        d = understand.understand([(phrase, 0.95, "vosk")], cfg=CFG, lexicon=lexicon)
+        assert d.intent == "close", phrase
+        assert d.slot_id == "app:telegram", phrase
+        assert d.action in ("execute", "confirm"), phrase

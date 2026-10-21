@@ -695,13 +695,44 @@ def launch_app(path, name: str, cfg_key: str = "") -> None:
 
 
 def close_app(process: str, display: str) -> None:
+    """Завершить процесс. taskkill первым, затем — проверка и доубив через psutil,
+    чтобы «Закрыл» означало реальное завершение, а не лишь отправленный сигнал
+    (Telegram и подобные часто респавнят дочерние процессы)."""
     rc = run_quiet(["taskkill", "/IM", process, "/F", "/T"])
-    if rc == 0:
-        notify(f"Закрываю {display}.")
-    elif rc == 128:
+    if rc == 128:
         notify(f"{display} и так не запущен.", ok=False)
-    else:
+        return
+    if rc != 0:
         notify(f"Не удалось закрыть {display} (код {rc}).", ok=False)
+        return
+    import time as _time
+    _time.sleep(0.6)
+    try:
+        alive = js.find_process(process)
+    except Exception:
+        # psutil не установлен — доверяем taskkill
+        notify(f"Закрыл {display}.")
+        return
+    if not alive:
+        notify(f"Закрыл {display}.")
+        return
+    # Доубил оставшиеся процессы напрямую.
+    killed = 0
+    for p in alive:
+        try:
+            p.kill()
+            killed += 1
+        except Exception:  # noqa: BLE001
+            continue
+    _time.sleep(0.4)
+    try:
+        still = js.find_process(process)
+    except Exception:
+        still = []
+    if not still:
+        notify(f"Завершил {display} ({killed} процессов).")
+    else:
+        notify(f"Не удалось закрыть {display} (процесс всё ещё работает).", ok=False)
 
 
 def _steam_alive() -> bool:
@@ -3487,7 +3518,13 @@ def U(key):  # ссылка из config.urls
     return lambda t: open_url(CFG["urls"].get(key), key)
 
 
-CLOSE = lambda t: has(t, "закр")
+CLOSE = lambda t: jarvis_routing.close_verb(t)
+
+# Процесс приложения для закрытия по имени, когда алиасы в конфиге не заданы:
+# «телеграм» → Telegram.exe и т.п. (используется close_app / taskkill).
+_APP_PROCESS = {
+    "телеграм": "Telegram.exe", "telegram": "Telegram.exe",
+}
 
 # Порядок важен: первая подошедшая команда выполняется, остальные пропускаются.
 # Третье поле — «только в игровом режиме».
@@ -3871,6 +3908,24 @@ def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> 
                  "hibernate": cmd_power, "lock": cmd_power}[power](text)
                 jarvis_history.DISPATCH.set("команда", text, "выполнена")
                 return
+            # Локальные команды закрытия приложений — приоритетнее болтовни в talk-режиме:
+            # «закрой/выключи/заверши/останови телеграм» закрываем здесь, а не отдаём нейросети.
+            if jarvis_routing.close_verb(text):
+                aliases = CFG.get("system", {}).get("app_aliases", {}) or {}
+                req = jarvis_routing.resolve_close(text, aliases)
+                if req["kind"] == "app":
+                    process = aliases.get(req["target"]) or _APP_PROCESS.get(
+                        req["target"].lower(), req["target"])
+                    close_app(process, req["label"])
+                    jarvis_history.DISPATCH.set("команда", text, "выполнена")
+                    return
+                if req["kind"] == "power_hint":
+                    notify(req["message"], ok=False)
+                    jarvis_history.DISPATCH.set("команда", text, "выполнена")
+                    return
+                if req["kind"] == "error" and not (req.get("target") or "").strip():
+                    _slot_ask("закрой", "Что закрыть?")
+                    return
             if not jarvis_history.is_filler(text) and ai_ready():
                 ask_ai(ai_question(text))
         return
@@ -4049,6 +4104,25 @@ def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> 
     # и не отправляются в нейросеть — молча.
     if addressed and jarvis_history.is_filler(text):
         return
+
+    # Локальные команды закрытия приложений — приоритетнее вопроса нейросети:
+    # «закрой/выключи/заверши/останови телеграм» закрываем здесь, а не отдаём в ask_ai.
+    if jarvis_routing.close_verb(text):
+        aliases = CFG.get("system", {}).get("app_aliases", {}) or {}
+        req = jarvis_routing.resolve_close(text, aliases)
+        if req["kind"] == "app":
+            process = aliases.get(req["target"]) or _APP_PROCESS.get(
+                req["target"].lower(), req["target"])
+            close_app(process, req["label"])
+            jarvis_history.DISPATCH.set("команда", text, "выполнена")
+            return
+        if req["kind"] == "power_hint":
+            notify(req["message"], ok=False)
+            jarvis_history.DISPATCH.set("команда", text, "выполнена")
+            return
+        if req["kind"] == "error" and not (req.get("target") or "").strip():
+            _slot_ask("закрой", "Что закрыть?")
+            return
     # Окно внимания продлеваем только на явное обращение (wake/имя/ручной ввод):
     # иначе каждая адресованная фраза сама себе продлевала +25 сек, и окно
     # держалось бесконечно — Джарвис отвечал на чужую речь рядом.
