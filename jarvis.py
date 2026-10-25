@@ -3279,8 +3279,18 @@ def cmd_todo(t):
     rows = _todo_load()
     if has(t, "что в списке", "покажи список", "список дел") and not has(t, "добав"):
         notify(ju.todo_text(rows)); return
-    if has(t, "очисти выполн"):
+    if has(t, "очисти выполн") or has(t, "удали всё выполнен") or has(t, "удали все выполнен") \
+            or has(t, "удали всё отмечен") or has(t, "удали все отмечен"):
         confirm("очистка выполненных дел", "Удалить выполненные дела?", lambda: (_todo_save(ju.todo_clear_done(rows)), notify("Выполненные дела очищены.")))
+        return
+    if has(t, "отметь", "отметить") and (has(t, "всё", "все")) and has(t, "выполнен"):
+        new = [dict(r, done=True) for r in rows]
+        if any(not r.get("done") for r in rows):
+            _todo_save(new)
+            journal_add("отметка всех дел", {"kind": "todo_restore", "rows": rows}, True)
+            notify("Отметил все дела выполненными.")
+        else:
+            notify("Все дела уже отмечены выполненными.")
         return
     if has(t, "удали", "удалить", "убери", "вычеркни") and has(t, "дел", "задач"):
         selector = re.sub(r".*?(?:удали(?:ть)?|убери|вычеркни)\s*(?:из\s+списка\s+дел\s*)?", "", t).strip()
@@ -3524,6 +3534,8 @@ CLOSE = lambda t: jarvis_routing.close_verb(t)
 # «телеграм» → Telegram.exe и т.п. (используется close_app / taskkill).
 _APP_PROCESS = {
     "телеграм": "Telegram.exe", "telegram": "Telegram.exe",
+    "дискорд": "Discord.exe", "discord": "Discord.exe",
+    "steam": "Steam.exe",
 }
 
 # Порядок важен: первая подошедшая команда выполняется, остальные пропускаются.
@@ -3557,7 +3569,9 @@ COMMANDS = [
     Cmd(lambda t: has(t, "брос", "кин", "бросок") and ("d" in t or "д" in t or has(t, "куб", "кост")), cmd_dice, False),
     Cmd(lambda t: has(t, "подбрось монет", "монетк"), cmd_dice, False),
     Cmd(lambda t: has(t, "список дел") or has(t, "добав") and has(t, "список")
-                  or has(t, "очисти выполн") or has(t, "отметь выполн")
+                  or has(t, "очисти выполн") or has(t, "удали всё выполнен") or has(t, "удали все выполнен")
+                  or has(t, "удали всё отмечен") or has(t, "удали все отмечен")
+                  or has(t, "отметь выполн") or has(t, "отметь всё выполнен") or has(t, "отметь все выполнен")
                   or (has(t, "удали", "убери", "вычеркни") and has(t, "дел", "задач")), cmd_todo, False),
     Cmd(lambda t: has(t, "таймер", "будильник", "секундомер", "засеки", "сколько осталось")
                   or has(t, "отмени таймер"), cmd_timer, False),
@@ -3914,6 +3928,15 @@ def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> 
                 aliases = CFG.get("system", {}).get("app_aliases", {}) or {}
                 req = jarvis_routing.resolve_close(text, aliases)
                 if req["kind"] == "app":
+                    # Discord запускается через Squirrel-Update.exe, который респавнит
+                    # основной процесс — гасим «няню» и само приложение (cmd_close_discord).
+                    # target может ещё содержать wake-слово/имя (вырезается ниже), поэтому
+                    # проверяем подстроку.
+                    target = (req.get("target") or "").lower()
+                    if "дискорд" in target or "discord" in target:
+                        cmd_close_discord(text)
+                        jarvis_history.DISPATCH.set("команда", text, "выполнена")
+                        return
                     process = aliases.get(req["target"]) or _APP_PROCESS.get(
                         req["target"].lower(), req["target"])
                     close_app(process, req["label"])
@@ -4111,6 +4134,13 @@ def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> 
         aliases = CFG.get("system", {}).get("app_aliases", {}) or {}
         req = jarvis_routing.resolve_close(text, aliases)
         if req["kind"] == "app":
+            # Discord запускается через Squirrel-Update.exe, который респавнит
+            # основной процесс — гасим «няню» и само приложение (cmd_close_discord).
+            target = (req.get("target") or "").lower()
+            if "дискорд" in target or "discord" in target:
+                cmd_close_discord(text)
+                jarvis_history.DISPATCH.set("команда", text, "выполнена")
+                return
             process = aliases.get(req["target"]) or _APP_PROCESS.get(
                 req["target"].lower(), req["target"])
             close_app(process, req["label"])
