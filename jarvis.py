@@ -407,6 +407,8 @@ def reload_config() -> None:
               find_genshin, find_minecraft, find_prism):
         f.cache_clear()
     STATE.voice_enabled = bool(CFG["voice"]["enabled"])
+    STATE.dnd_mode = bool(CFG.get("voice", {}).get("dnd", False))
+    STATE.tts_volume = int(CFG.get("voice", {}).get("tts_volume", 100))
     # Сброс кеша STT: смена движка/порога/модели применяется без перезапуска.
     # Следующий вызов stt_engine() создаст движок с новыми параметрами.
     global STT_ENGINE
@@ -1048,7 +1050,8 @@ def _piper_say(text: str) -> None:
 
     scale = _piper_rate_to_scale(CFG["voice"].get("rate", 175))
     p.speak_piper(text, voice=CFG["voice"].get("piper_voice", "dmitri"),
-                  length_scale=scale)
+                  length_scale=scale,
+                  volume=int(getattr(STATE, "tts_volume", 100)) / 100.0)
 
 
 def _sapi_name():
@@ -1108,6 +1111,10 @@ class Speaker:
         if sapi is None or cur != sig:  # голос или скорость поменяли в настройках
             sapi, sig = make_sapi(), cur
             sapi_state[:] = [sapi, sig]
+        try:
+            sapi.Volume = max(0, min(100, int(STATE.tts_volume)))
+        except Exception:
+            pass
         sapi.Speak(text, 0)  # 0 = дождаться конца фразы
 
     @staticmethod
@@ -1179,6 +1186,10 @@ class State:
         self.pending_clarify: tuple | None = None  # (opts, исходная фраза) при переспросе
         self.pending_slot: dict | None = None  # ожидание слота: {verb, until}
         self.pending_open: dict | None = None  # выбор файла: {paths, until}
+        self.dnd_mode = bool(CFG.get("voice", {}).get("dnd", False))  # тихий режим: без озвучки
+        self.tts_volume = int(CFG.get("voice", {}).get("tts_volume", 100))  # громкость голоса Джарвиса 0-100
+        self.last_speak: str | None = None  # последний текст, который озвучил Джарвис
+        self.last_actions: list[dict] = []  # стек последних обратимых действий для отмены
 
 
 def _slot_ask(verb: str, question: str) -> None:
@@ -1276,8 +1287,10 @@ def notify(message: str, ok: bool = True, force_speak: bool = False) -> None:
     if notifier:
         base = int(CFG.get("notifications", {}).get("duration_ms", 5000))
         notifier.show(message, ok, max(base, min(15000, 60 * len(message))))
-    if speaker and (STATE.voice_enabled or force_speak):
+    speak = bool(speaker and (STATE.voice_enabled or force_speak) and not STATE.dnd_mode)
+    if speak:
         speaker.say(speakable(message))
+        STATE.last_speak = speakable(message)
 
 
 # ============================================================================
@@ -1661,7 +1674,8 @@ def commands_text(full: bool = False) -> str:
 — «Джарвис, установи wukong» — установка игры из Steam; после этого «запусти вуконг» работает голосом
 — «напечатай …» — набор текста в активном окне
 — выключи / перезагрузи пк — через {CFG["shutdown_delay_sec"]} с; «отмена» — отменить
-— голос — вкл/выкл голосовые ответы
+— тихий режим / выключи тихий режим — только уведомления без голоса
+— громкость голоса на N / голос тише / голос громче — громкость 대답ов Джарвиса 0-100
 — открой настройки — окно настроек (свои команды, игры, ссылки, пути, автозапуск)
 — «{CFG["phrases"]["study_mode"]}» / «{CFG["phrases"]["play_mode"]}» — учебный / игровой режим
 — «{CFG["phrases"]["pause"]}» — пауза, «{CFG["phrases"]["resume"]}» — продолжить
@@ -2568,9 +2582,25 @@ def cmd_help(t):
     notify("Список команд открыт. Скажи «все команды», чтобы увидеть полный.")
 
 
-def cmd_voice(t):
-    STATE.voice_enabled = not STATE.voice_enabled
-    notify(f"Голосовой вывод {'включён' if STATE.voice_enabled else 'выключен'}.", force_speak=True)
+def cmd_dnd(t):
+    """«включи тихий режим» / «выключи тихий режим» — без озвучки, только уведомления."""
+    if has(t, "выключ", "отключ", "выкл", "хватит", "достаточно", "выключи"):
+        STATE.dnd_mode = False
+        save_user_config({"voice": {"dnd": False}})
+        notify("Тихий режим выключен. Буду озвучивать ответы.", force_speak=True)
+    else:
+        STATE.dnd_mode = True
+        save_user_config({"voice": {"dnd": True}})
+        notify("Тихий режим включен. Отвечаю только уведомлениями на экране, без голоса.", force_speak=True)
+
+
+def cmd_repeat_speak(t):
+    """«повтори что сказал» / «ещё раз» — проговорить последнюю реплику Джарвиса."""
+    text = STATE.last_speak
+    if not text:
+        notify("Не могу вспомнить, что я только что сказал.", ok=False)
+        return
+    notify(f"Ещё раз: {text}", force_speak=True)
 
 
 def cmd_forget(t):
@@ -2579,6 +2609,16 @@ def cmd_forget(t):
         ASSISTANT.forget()
     STATE.attention_until = 0.0
     notify("Забыл разговор. Начнём заново?")
+
+
+def cmd_voice(t):
+    """«голос» — сообщить статус озвучки или переключить микрофон."""
+    if has(t, "выкл", "отключ", "выключи"):
+        STATE.voice_enabled = not STATE.voice_enabled
+        save_user_config({"voice": {"enabled": STATE.voice_enabled}})
+        notify(f"Голос {'включен' if STATE.voice_enabled else 'выключен'}.")
+    else:
+        notify(f"Голос {'включен' if STATE.voice_enabled else 'выключен'}.")
 
 
 def talk_auto_exit_sec() -> float:
@@ -3110,9 +3150,53 @@ def cmd_volume(t):
             n = _number(t)
             if n is None: raise js.ActionError("не расслышал уровень громкости")
             result = f"Громкость: {js.volume_set(n)}%."
-        journal_add("громкость", {"kind": "volume", "value": old}, True)
+        _record_action("громкость", {"kind": "volume", "value": old}, True)
         notify(result)
     _async("Громкость", work)
+
+
+def cmd_tts_volume(t):
+    """«поставь громкость голоса на 50», «голос тише», «голос громче» — loudness TTS 0-100."""
+    def work():
+        n = _number(t)
+        if has(t, "тише", "убав", "поменьше"):
+            new = max(0, STATE.tts_volume - 15)
+        elif has(t, "громче", "прибав", "побольше"):
+            new = min(100, STATE.tts_volume + 15)
+        elif n is not None:
+            new = max(0, min(100, n))
+        else:
+            raise js.ActionError("не расслышал уровень громкости голоса")
+        STATE.tts_volume = new
+        save_user_config({"voice": {"tts_volume": new}})
+        notify(f"Громкость голоса: {new}%.")
+    _async("Громкость голоса", work)
+
+
+def cmd_microphone(t):
+    """«какой микрофон», «список микрофонов» — показать устройства ввода."""
+    def work():
+        try:
+            import pyaudiowpatch as pa
+        except ImportError:
+            try:
+                import pyaudio as pa
+            except ImportError:
+                notify("Нет pyaudio/pyaudiowpatch — нельзя список микрофонов.", ok=False)
+                return
+        p = pa.PyAudio()
+        try:
+            default = p.get_default_input_device_info()
+            lines = [f"Текущий микрофон: {default['name']}"]
+            for i in range(p.get_device_count()):
+                info = p.get_device_info_by_index(i)
+                if info.get("maxInputChannels", 0) > 0:
+                    mark = " (по умолчанию)" if i == default["index"] else ""
+                    lines.append(f"  #{i} {info['name']}{mark}")
+            notify(". ".join(lines))
+        finally:
+            p.terminate()
+    _async("Микрофон", work)
 
 
 def cmd_brightness(t):
@@ -3126,7 +3210,7 @@ def cmd_brightness(t):
             n = _number(t)
             if n is None: raise js.ActionError("не расслышал яркость")
             val = js.brightness_set(n)
-        journal_add("яркость", {"kind": "brightness", "value": old}, True)
+        _record_action("яркость", {"kind": "brightness", "value": old}, True)
         notify(f"Яркость: {val}%.")
     _async("Яркость", work)
 
@@ -3148,6 +3232,30 @@ def cmd_processes(t):
         text = "; ".join(f"{r['name']} — ЦП {r['cpu']:.0f}%, ОЗУ {r['ram_mb']:.0f} МБ" for r in rows[:5])
         notify("Сейчас больше всего ресурсов используют: " + text)
     _async("Процессы", work)
+
+
+def cmd_system_status(t):
+    """«загрузка системы», «сколько памяти», «свободно места» — через psutil."""
+    def work():
+        import psutil
+        parts = []
+        if has(t, "загрузк", "процессор", "цп", "cpu"):
+            parts.append(f"Загрузка ЦП: {psutil.cpu_percent(interval=0.5)}%")
+        if has(t, "память", "оператив", "ram", "оЗУ"):
+            vm = psutil.virtual_memory()
+            parts.append(f"ОЗУ: {vm.percent}% ({vm.available // (1024*1024)} МБ свободно)")
+        if has(t, "диск", "место", "свободно", "гигабайт"):
+            try:
+                du = psutil.disk_usage("C:\\")
+                parts.append(f"Диск C: {du.percent}% занято ({du.free // (1024*1024*1024)} ГБ свободно)")
+            except Exception:
+                parts.append("Не смог прочитать диск C:")
+        if not parts:
+            parts = [f"ЦП: {psutil.cpu_percent(interval=0.5)}%",
+                     f"ОЗУ: {psutil.virtual_memory().percent}%",
+                     f"Диск C: {psutil.disk_usage('C:\\').percent}%"]
+        notify("; ".join(parts))
+    _async("Статус системы", work)
 
 
 def cmd_close_any(t):
@@ -3287,7 +3395,7 @@ def cmd_todo(t):
         new = [dict(r, done=True) for r in rows]
         if any(not r.get("done") for r in rows):
             _todo_save(new)
-            journal_add("отметка всех дел", {"kind": "todo_restore", "rows": rows}, True)
+            _record_action("отметка всех дел", {"kind": "todo_restore", "rows": rows}, True)
             notify("Отметил все дела выполненными.")
         else:
             notify("Все дела уже отмечены выполненными.")
@@ -3296,18 +3404,18 @@ def cmd_todo(t):
         selector = re.sub(r".*?(?:удали(?:ть)?|убери|вычеркни)\s*(?:из\s+списка\s+дел\s*)?", "", t).strip()
         selector = re.sub(r"^(?:дело|задачу|задача|пункт)\s*(?:номер|№)?\s*", "", selector).strip()
         new, hit = ju.todo_remove(rows, selector)
-        if hit: _todo_save(new); journal_add("удаление дела", {"kind": "todo_restore", "rows": rows}, True); notify(f"Удалил: {hit}.")
+        if hit: _todo_save(new); _record_action("удаление дела", {"kind": "todo_restore", "rows": rows}, True); notify(f"Удалил: {hit}.")
         else: notify("Не нашёл такое дело.", ok=False)
         return
     if has(t, "отмет", "выполнен"):
         selector = re.sub(r".*?(?:выполненным|выполнено|отметь)\s*", "", t).strip()
         new, hit = ju.todo_done(rows, selector)
-        if hit: _todo_save(new); journal_add("отметка дела", {"kind": "todo_restore", "rows": rows}, True); notify(f"Готово: {hit}.")
+        if hit: _todo_save(new); _record_action("отметка дела", {"kind": "todo_restore", "rows": rows}, True); notify(f"Готово: {hit}.")
         else: notify("Не нашёл такое дело.", ok=False)
         return
     m = re.search(r"\bдобав(?:ь|ить)?\s+(?:в )?спис(?:ок)? дел\s+(.+)", t)
     if m:
-        new = ju.todo_add(rows, m.group(1)); _todo_save(new); journal_add("добавлено дело", {"kind": "todo_restore", "rows": rows}, True); notify("Добавил в список дел.")
+        new = ju.todo_add(rows, m.group(1)); _todo_save(new); _record_action("добавлено дело", {"kind": "todo_restore", "rows": rows}, True); notify("Добавил в список дел.")
 
 
 def cmd_dice(t):
@@ -3457,7 +3565,68 @@ def cmd_briefing(t):
     _async("Утренний брифинг", work)
 
 
+def _record_action(action: str, undo: dict | None = None, reversible: bool = False, ttl_sec: float = 10.0) -> None:
+    """Записать деструктивное действие в стек для быстрой отмены (и в журнал)."""
+    entry = {"action": action, "time": time.time(), "ttl": ttl_sec, "undo": undo or {}}
+    STATE.last_actions.append(entry)
+    # keeping stack small
+    if len(STATE.last_actions) > 20:
+        STATE.last_actions = STATE.last_actions[-20:]
+    journal_add(action, undo, reversible)
+
+
+def cmd_time_date(t):
+    """«который час», «какое сегодня число», «день недели» — локально, без нейросети."""
+    now = datetime.now()
+    if has(t, "который час", "какое время", "время", "час"):
+        notify(f"Сейчас {now:%H:%M}.")
+    elif has(t, "какое сегодня число", "какая дата", "дата", "число"):
+        notify(f"Сегодня {now:%d.%m.%Y}, {now:%A}.")
+    elif has(t, "день недели"):
+        notify(f"Сегодня {now:%A}.")
+    else:
+        notify(f"Сейчас {now:%H:%M}, сегодня {now:%d.%m.%Y}.")
+
+
 def cmd_undo(t):
+    # сначала пытаемся отменить последнее действие из стека (быстрая отмена)
+    now = time.time()
+    while STATE.last_actions:
+        entry = STATE.last_actions[-1]
+        if now - entry["time"] > entry.get("ttl", 10.0):
+            STATE.last_actions.pop()
+            continue
+        undo = entry.get("undo") or {}
+        kind = undo.get("kind")
+        try:
+            if kind == "volume":
+                js.volume_set(undo["value"])
+            elif kind == "brightness":
+                js.brightness_set(undo["value"])
+            elif kind == "todo_restore":
+                _todo_save(undo["rows"])
+            elif kind == "timer_cancel":
+                TIMER_STORE.cancel(undo.get("text", ""))
+            elif kind == "close_app":
+                # пытаемся открыть обратно закрытое приложение
+                proc = undo.get("process")
+                label = undo.get("label", "")
+                if proc:
+                    launch_app(proc, label, proc)
+            else:
+                notify("Это действие нельзя автоматически отменить.", ok=False)
+                STATE.last_actions.pop()
+                continue
+            STATE.last_actions.pop()
+            journal_add("откат: " + entry["action"])
+            notify(f"Последнее действие отменено: {entry['action']}.")
+            return
+        except Exception as e:
+            log_error("Откат (стек)", e)
+            STATE.last_actions.pop()
+            continue
+
+    # fallback — журнал действий
     try:
         rows = [json.loads(x) for x in JOURNAL_PATH.read_text(encoding="utf-8").splitlines() if x.strip()]
         row = next((r for r in reversed(rows) if r.get("reversible")), None)
@@ -3547,8 +3716,9 @@ COMMANDS = [
     Cmd(lambda t: has(t, "восстанови настройки"), cmd_restore_settings, False),
     Cmd(lambda t: has(t, "настройк"), cmd_settings, False),
     Cmd(lambda t: has(t, "лайкни трек", "добавь в плейлист"), cmd_music_ui, False),
-    Cmd(lambda t: has(t, "отмени последнее действие"), cmd_undo, False),
+    Cmd(lambda t: has(t, "отмени последнее действие", "отмени последнее", "отмени действие"), cmd_undo, False),
     Cmd(lambda t: has(t, "доброе утро", "утренний брифинг"), cmd_briefing, False),
+    Cmd(lambda t: has(t, "который час", "какое время", "какое сегодня число", "какая дата", "день недели"), cmd_time_date, False),
     Cmd(lambda t: has(t, "прочитай уведомлен"), cmd_notifications, False),
     Cmd(lambda t: has(t, "переведи буфер"), cmd_translate_clipboard, False),
     Cmd(lambda t: has(t, "прочитай буфер", "прочитай выделенн", "прочти выделенн",
@@ -3558,9 +3728,12 @@ COMMANDS = [
     Cmd(lambda t: re.match(r".+\s+(?:тише|громче|громкость\s+на)", t) is not None, cmd_app_volume, False),
     Cmd(lambda t: has(t, "громч", "тише", "убав", "прибав") or has(t, "громкость")
                   or has(t, "выключи звук", "включи звук"), cmd_volume, False),
+    Cmd(lambda t: has(t, "громкость голоса", "голос тише", "голос громче", "поставь громкость голоса"), cmd_tts_volume, False),
     Cmd(lambda t: has(t, "ярче", "темнее") or has(t, "яркость"), cmd_brightness, False),
     Cmd(lambda t: has(t, "заблокир") or has(t, "режим сна", "гибернац"), cmd_power, False),
     Cmd(lambda t: has(t, "что запущено", "грузит процессор"), cmd_processes, False),
+    Cmd(lambda t: has(t, "загрузка системы", "сколько памяти", "свободно места", "загрузк системы", "состояние системы"), cmd_system_status, False),
+    Cmd(lambda t: has(t, "какой микрофон", "список микрофонов", "устройство ввода"), cmd_microphone, False),
     Cmd(lambda t: has(t, "сделай скриншот", "снимок экрана"), cmd_screenshot, False),
     Cmd(lambda t: has(t, "запиши последние тридцать секунд", "запиши последние 30 секунд"), cmd_gamebar, True),
     Cmd(lambda t: has(t, "запусти тесты"), cmd_tests, False),
@@ -3609,7 +3782,8 @@ COMMANDS = [
     Cmd(lambda t: has(t, "истори", "повтори последн", "что я говорил"), cmd_history, False),
     Cmd(lambda t: has(t, "напоминани"), cmd_reminders, False),  # покажи/удали напоминания
     Cmd(lambda t: has(t, "напомни"), cmd_remind, False),        # напомни мне …
-    Cmd(lambda t: is_word(t, "голос"), cmd_voice, False),
+    Cmd(lambda t: has(t, "тихий режим", "режим не беспокоить", "не беспокоить"), cmd_dnd, False),
+    Cmd(lambda t: has(t, "повтори что сказал", "ещё раз", "повтори последний ответ"), cmd_repeat_speak, False),
     Cmd(lambda t: has(t, "забудь", "забыть") or has(t, "новый разговор"), cmd_forget, False),
     Cmd(lambda t: has(t, "режим разговора", "режим болтовни", "режим диалога", "режим общения")
         or (has(t, "обычный режим", "режим команд") and has(t, "включ", "переключ", "верн")),
@@ -3937,6 +4111,13 @@ def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> 
                         cmd_close_discord(text)
                         jarvis_history.DISPATCH.set("команда", text, "выполнена")
                         return
+                    # Пользовательские команды закрытия приложений (из настроек).
+                    close_commands = CFG.get("close_commands", {}) or {}
+                    if req["target"] in close_commands:
+                        process = close_commands[req["target"]]
+                        close_app(process, req["label"])
+                        jarvis_history.DISPATCH.set("команда", text, "выполнена")
+                        return
                     process = aliases.get(req["target"]) or _APP_PROCESS.get(
                         req["target"].lower(), req["target"])
                     close_app(process, req["label"])
@@ -4141,6 +4322,13 @@ def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> 
                 cmd_close_discord(text)
                 jarvis_history.DISPATCH.set("команда", text, "выполнена")
                 return
+            # Пользовательские команды закрытия приложений (из настроек).
+            close_commands = CFG.get("close_commands", {}) or {}
+            if req["target"] in close_commands:
+                process = close_commands[req["target"]]
+                close_app(process, req["label"])
+                jarvis_history.DISPATCH.set("команда", text, "выполнена")
+                return
             process = aliases.get(req["target"]) or _APP_PROCESS.get(
                 req["target"].lower(), req["target"])
             close_app(process, req["label"])
@@ -4237,7 +4425,16 @@ def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> 
     # Ничего не понято: короткий отклик вместо молчания и одна запись «не понял».
     # Болтовню рядом (не addressed и не похоже на команду) игнорируем без отклика.
     if addressed or _looks_like_command(text):
-        notify("Не понял, повтори.", ok=False)
+        # подсказка: какие команды были бы ближе всего
+        try:
+            _, matches = jarvis_routing.diagnose(text)
+            if matches:
+                opts = ", ".join(f"«{m.name}»" for m in matches[:3])
+                notify(f"Не понял. Ты имел в виду: {opts}?", ok=False)
+            else:
+                notify("Не понял, повтори.", ok=False)
+        except Exception:
+            notify("Не понял, повтори.", ok=False)
         jarvis_history.DISPATCH.set("команда", text, "не понял")
 
 

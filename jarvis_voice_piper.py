@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import audioop
 import urllib.request
 import wave
 import winsound
@@ -95,10 +96,11 @@ def _load(name: str):
 
 
 def speak_piper(text: str, voice: str = DEFAULT_PIPER_VOICE,
-                length_scale: float | None = None) -> None:
+                length_scale: float | None = None, volume: float = 1.0) -> None:
     """Озвучить текст голосом Piper (блокирующий вызов, ~реалтайм на CPU).
 
     length_scale: темп (1.0 — норма, <1 — быстрее, >1 — медленнее).
+    volume: коэффициент громкости 0.0..1.0 (1.0 — без изменений).
     """
     from piper import SynthesisConfig
 
@@ -116,4 +118,20 @@ def speak_piper(text: str, voice: str = DEFAULT_PIPER_VOICE,
             v.synthesize_wav(text, wav, syn_config=cfg)
         else:
             v.synthesize_wav(text, wav)
-    winsound.PlaySound(str(tmp), winsound.SND_FILENAME)
+    # winsound.PlaySound не умеет менять громкость — для volume < 1.0
+    # ослабляем сырые PCM-сэмплы и играем уже тихий файл.
+    if 0.0 < volume < 1.0:
+        with wave.open(str(tmp), "rb") as src:
+            nch = src.getnchannels()
+            sw = src.getsampwidth()
+            rate = src.getframerate()
+            raw = src.readframes(src.getnframes())
+        quiet = voices_dir() / "_say_q.wav"
+        with wave.open(str(quiet), "wb") as wf:
+            wf.setnchannels(nch)
+            wf.setsampwidth(sw)
+            wf.setframerate(rate)
+            wf.writeframes(audioop.mul(raw, sw, volume))
+        winsound.PlaySound(str(quiet), winsound.SND_FILENAME)
+    else:
+        winsound.PlaySound(str(tmp), winsound.SND_FILENAME)

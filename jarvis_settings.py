@@ -555,7 +555,7 @@ class SettingsWindow:
                      fg_color="#102b29", corner_radius=12, padx=13, pady=7).pack(
                          side="right", padx=18, pady=14)
 
-        names = ["Мои команды", "Игры Steam", "Сайты", "Ссылки", "Общие",
+        names = ["Мои команды", "Игры Steam", "Сайты", "Закрытие приложений", "Ссылки", "Общие",
                  "Безопасность", "Уведомления", "Интеграции", "Диктовка", "Распознавание",
                  "История"]
         if ai is not None:
@@ -567,7 +567,7 @@ class SettingsWindow:
         self.tabs = tabs = TabHost(w)
         # Вкладки со собственной прокруткой (таблицы и те, что сами создают
         # CTkScrollableFrame) — scroll=False, иначе будет двойная полоса.
-        own_scroll = {"Мои команды", "Игры Steam", "Сайты",
+        own_scroll = {"Мои команды", "Игры Steam", "Сайты", "Закрытие приложений",
                       "Общие", "Нейросеть", "Распознавание"}
         t = {name: tabs.add(name, scroll=name not in own_scroll)
              for name in names + ["Пути"]}
@@ -591,7 +591,11 @@ class SettingsWindow:
             [("Фраза", 200, 2, 40), ("Ссылка", 300, 5, 120)],
             validators={1: lambda v: None if re.match(r"https?://", v, re.I)
                         else "Ссылка должна начинаться с http:// или https://"})
-        for tab in (self.t_cmd, self.t_games, self.t_sites):
+        self.t_close = TableTab(
+            t["Закрытие приложений"], w,
+            "Фраза → имя процесса, который нужно закрыть. Например: «дискорд» → \"Discord.exe\", «скип» → \"Spotify.exe\".",
+            [("Фраза", 220, 2, 40), ("Процесс", 260, 2, 120)])
+        for tab in (self.t_cmd, self.t_games, self.t_sites, self.t_close):
             tab.pack(fill="both", expand=True, padx=4, pady=2)
 
         self._build_links(t["Ссылки"])
@@ -609,6 +613,7 @@ class SettingsWindow:
         self.t_cmd.load((c["phrase"], c["target"]) for c in cfg["commands"])
         self.t_games.load(sorted(cfg["games"].items()))
         self.t_sites.load(sorted(cfg["sites"].items()))
+        self.t_close.load(sorted(cfg.get("close_commands", {}).items()))
 
         bottom = ctk.CTkFrame(w, fg_color=HEADER_BG, corner_radius=14,
                               border_width=1, border_color=CARD_BORDER)
@@ -706,6 +711,27 @@ class SettingsWindow:
         self._field(card, 4, "Задержка выключения / перезагрузки", self.v_delay, "секунд, от 0 до 600")
         self.v_delay.grid_configure(sticky="w")
         ctk.CTkFrame(card, fg_color="transparent", height=10).grid(row=5, column=0)
+
+        # --- тихий режим и громкость голоса
+        card_dnd = self._card(sf, "Тихий режим и громкость голоса", 5)
+        self.sw_dnd = ctk.CTkSwitch(card_dnd, text="Тихий режим (только уведомления, без голоса)",
+                                     font=_font(), progress_color=ACCENT)
+        self.sw_dnd.grid(row=1, column=0, columnspan=3, sticky="w", padx=16, pady=5)
+        if c.get("voice", {}).get("dnd"):
+            self.sw_dnd.select()
+        self.v_tts_volume = ctk.CTkSlider(card_dnd, from_=0, to=100, number_of_steps=100,
+                                           width=260)
+        self.v_tts_volume.set(c.get("voice", {}).get("tts_volume", 100))
+        self.v_tts_volume.grid(row=2, column=0, columnspan=3, sticky="w", padx=16, pady=(8, 4))
+        self.lbl_tts_volume = ctk.CTkLabel(card_dnd, text=f"Громкость голоса: {int(self.v_tts_volume.get())}%",
+                                            font=_font(11), text_color=MUTED)
+        self.lbl_tts_volume.grid(row=3, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 10))
+
+        def _on_tts_volume(val):
+            self.lbl_tts_volume.configure(text=f"Громкость голоса: {int(float(val))}%")
+
+        self.v_tts_volume.configure(command=_on_tts_volume)
+        ctk.CTkFrame(card_dnd, fg_color="transparent", height=6).grid(row=4, column=0)
 
         # --- диктовка («надиктуй …» в активное окно)
         card = self._card(sf, "Диктовка («надиктуй …»)", 1)
@@ -1278,8 +1304,11 @@ class SettingsWindow:
             "commands": [{"phrase": p, "target": t} for p, t in self.t_cmd.rows()],
             "games": {p: int(a) for p, a in self.t_games.rows()},
             "sites": {p: u for p, u in self.t_sites.rows()},
+            "close_commands": {p: u for p, u in self.t_close.rows()},
             "urls": {k: (v.get().strip() or None) for k, v in self.v_urls.items()},
             "voice": {"enabled": bool(self.sw_voice.get()),
+                      "dnd": bool(self.sw_dnd.get()),
+                      "tts_volume": int(self.v_tts_volume.get()),
                       "engine": "piper" if self.v_engine.get().startswith("piper") else "sapi",
                       "piper_voice": self.v_piper.get().split(" ")[0].lower() or "dmitri"},
             "shutdown_delay_sec": delay,
