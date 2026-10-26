@@ -3,6 +3,7 @@ SpeechRecognition>=3.10
 PyAudioWPatch
 pyttsx3
 piper-tts
+edge-tts
 pyautogui
 pywin32
 ytmusicapi

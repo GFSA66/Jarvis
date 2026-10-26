@@ -693,10 +693,11 @@ class SettingsWindow:
         voices = c.get("voice", {})
         eng = (voices.get("engine") or "piper").lower()
         cur_pv = (voices.get("piper_voice") or "dmitri").lower()
-        self.v_engine = ctk.CTkOptionMenu(card, values=["piper (живой)", "sapi (системный)"],
-                                          font=_font(), width=170)
-        self.v_engine.set("piper (живой)" if eng == "piper" else "sapi (системный)")
-        self._field(card, 2, "Движок голоса", self.v_engine, "piper — живой нейроголос офлайн")
+        cur_ev = (voices.get("edge_voice") or "dmitri").lower()
+        self.v_engine = ctk.CTkOptionMenu(card, values=["piper (живой)", "edge (нейроголос Microsoft)", "sapi (системный)"],
+                                          font=_font(), width=220)
+        self.v_engine.set({"piper": "piper (живой)", "edge": "edge (нейроголос Microsoft)", "sapi": "sapi (системный)"}.get(eng, "piper (живой)"))
+        self._field(card, 2, "Движок голоса", self.v_engine, "piper — офлайн; edge — онлайн (Microsoft Neural)")
         self.v_engine.grid_configure(sticky="w")
         self.v_piper = ctk.CTkOptionMenu(
             card, values=["dmitri — мужской, живой", "ruslan — мужской, спокойный",
@@ -705,12 +706,19 @@ class SettingsWindow:
         labels = {"dmitri": "dmitri — мужской, живой", "ruslan": "ruslan — мужской, спокойный",
                   "irina": "irina — женский", "denis": "denis — мужской"}
         self.v_piper.set(labels.get(cur_pv, labels["dmitri"]))
-        self._field(card, 3, "Живой голос", self.v_piper, "первая реплика скачает ~63 МБ, дальше офлайн")
+        self._field(card, 3, "Живой голос (Piper)", self.v_piper, "первая реплика скачает ~63 МБ, дальше офлайн")
         self.v_piper.grid_configure(sticky="w")
+        self.v_edge = ctk.CTkOptionMenu(
+            card, values=["dmitri — мужской (Дмитрий)", "svetlana — женский (Светлана)"],
+            font=_font(), width=250)
+        elabels = {"dmitri": "dmitri — мужской (Дмитрий)", "svetlana": "svetlana — женский (Светлана)"}
+        self.v_edge.set(elabels.get(cur_ev, elabels["dmitri"]))
+        self._field(card, 4, "Голос Edge TTS", self.v_edge, "нейроголос Microsoft, нужен интернет")
+        self.v_edge.grid_configure(sticky="w")
         self.v_delay = _entry(card, str(c["shutdown_delay_sec"]), width=80)
-        self._field(card, 4, "Задержка выключения / перезагрузки", self.v_delay, "секунд, от 0 до 600")
+        self._field(card, 5, "Задержка выключения / перезагрузки", self.v_delay, "секунд, от 0 до 600")
         self.v_delay.grid_configure(sticky="w")
-        ctk.CTkFrame(card, fg_color="transparent", height=10).grid(row=5, column=0)
+        ctk.CTkFrame(card, fg_color="transparent", height=10).grid(row=6, column=0)
 
         # --- тихий режим и громкость голоса
         card_dnd = self._card(sf, "Тихий режим и громкость голоса", 5)
@@ -1309,8 +1317,11 @@ class SettingsWindow:
             "voice": {"enabled": bool(self.sw_voice.get()),
                       "dnd": bool(self.sw_dnd.get()),
                       "tts_volume": int(self.v_tts_volume.get()),
-                      "engine": "piper" if self.v_engine.get().startswith("piper") else "sapi",
-                      "piper_voice": self.v_piper.get().split(" ")[0].lower() or "dmitri"},
+                      "engine": ("piper" if self.v_engine.get().startswith("piper")
+                                 else "edge" if self.v_engine.get().startswith("edge")
+                                 else "sapi"),
+                      "piper_voice": self.v_piper.get().split(" ")[0].lower() or "dmitri",
+                      "edge_voice": self.v_edge.get().split(" ")[0].lower() or "dmitri"},
             "shutdown_delay_sec": delay,
             "wake_word": {"enabled": bool(self.sw_wake.get()), "word": wake or "джарвис"},
             "chrome": {"main_profile": self.v_prof_main.get().strip() or "Default",

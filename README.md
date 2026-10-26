@@ -105,7 +105,12 @@ build_exe.bat
 
 Живые голоса на выбор: `dmitri` (мужской, по умолчанию), `ruslan` (мужской, спокойный),
 `irina` (женский), `denis` (мужской). Смена: окно настроек → вкладка «Общие» → «Живой голос»,
-или `config.json → voice.piper_voice`. Движок переключается там же (`voice.engine`: `piper` / `sapi`).
+или `config.json → voice.piper_voice`. Движок переключается там же (`voice.engine`: `piper` / `edge` / `sapi`).
+
+Также доступен **Edge TTS** — нейроголос Microsoft (онлайн, нужен интернет). Голоса:
+`dmitri` (ru-RU-DmitryNeural, мужской) и `svetlana` (ru-RU-SvetlanaNeural, женский).
+Смена: окно настроек → вкладка «Общие» → «Движок голоса» → «edge», затем «Голос Edge TTS»,
+или `config.json → voice.engine = "edge"` и `voice.edge_voice`. Запасной голос — Windows SAPI.
 
 Проверить голос: кнопка **«Проверить голос»** в настройках (вкладка «Общие»)
 или `.venv\Scripts\python jarvis.py --say "проверка"`. Список голосов: `--list-voices`.

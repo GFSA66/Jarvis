@@ -198,7 +198,7 @@ DEFAULT_CONFIG = {
         "sensitivity": "normal",  # strict | normal | soft
     },
     "voice": {"enabled": True, "engine": "piper", "piper_voice": "dmitri",
-              "id": None, "rate": 175},
+              "edge_voice": "dmitri", "id": None, "rate": 175},
     "dictation": {"delay_sec": 3, "paste_delay": 0.6, "restore_clipboard": True,
                   "method": "auto", "char_delay_ms": 8, "autoformat": True,
                   "idle_timeout_sec": 120, "blacklist": ["пароль", "password", " pin ",
@@ -1054,6 +1054,13 @@ def _piper_say(text: str) -> None:
                   volume=int(getattr(STATE, "tts_volume", 100)) / 100.0)
 
 
+def _edge_say(text: str) -> None:
+    import jarvis_voice_edge as e
+
+    e.speak_edge(text, voice=CFG["voice"].get("edge_voice", "dmitri"),
+                 rate=CFG["voice"].get("rate", 175),
+                 volume=int(getattr(STATE, "tts_volume", 100)) / 100.0)
+
 def _sapi_name():
     try:
         _sp, tokens = sapi_voices()
@@ -1076,6 +1083,9 @@ def current_voice_name():
         if p.is_downloaded(name):
             return f"Piper «{name}» (живой нейроголос, офлайн)"
         return f"Piper «{name}» (скачается ~63 МБ при первой реплике)"
+    if engine == "edge":
+        name = (CFG["voice"].get("edge_voice") or "dmitri").lower()
+        return f"Edge TTS «{name}» (нейроголос Microsoft, нужен интернет)"
     try:
         _sp, tokens = sapi_voices()
     except Exception:
@@ -1148,6 +1158,12 @@ class Speaker:
                     except Exception as e:
                         log_error("Озвучка (Piper)", e)
                         self._speak_sapi(text, sapi_state)  # нет модели/интернета — SAPI
+                elif engine == "edge":
+                    try:
+                        _edge_say(text)
+                    except Exception as e:
+                        log_error("Озвучка (Edge TTS)", e)
+                        self._speak_sapi(text, sapi_state)  # нет интернета — SAPI
                 else:
                     self._speak_sapi(text, sapi_state)
                 fails = 0

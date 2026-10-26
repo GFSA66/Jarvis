@@ -120,18 +120,27 @@ def speak_piper(text: str, voice: str = DEFAULT_PIPER_VOICE,
             v.synthesize_wav(text, wav)
     # winsound.PlaySound не умеет менять громкость — для volume < 1.0
     # ослабляем сырые PCM-сэмплы и играем уже тихий файл.
+    # Добавляем небольшую тишину в конец: winsound/MCI иначе обрезает
+    # последние фонемы («съедает» последние буквы).
+    with wave.open(str(tmp), "rb") as src:
+        nch = src.getnchannels()
+        sw = src.getsampwidth()
+        rate = src.getframerate()
+        raw = src.readframes(src.getnframes())
+    silence = b"\x00" * (int(rate * 0.35) * nch * sw)
+    raw = raw + silence
     if 0.0 < volume < 1.0:
-        with wave.open(str(tmp), "rb") as src:
-            nch = src.getnchannels()
-            sw = src.getsampwidth()
-            rate = src.getframerate()
-            raw = src.readframes(src.getnframes())
         quiet = voices_dir() / "_say_q.wav"
         with wave.open(str(quiet), "wb") as wf:
             wf.setnchannels(nch)
             wf.setsampwidth(sw)
             wf.setframerate(rate)
             wf.writeframes(audioop.mul(raw, sw, volume))
-        winsound.PlaySound(str(quiet), winsound.SND_FILENAME)
+        winsound.PlaySound(str(quiet), winsound.SND_FILENAME | winsound.SND_SYNC)
     else:
-        winsound.PlaySound(str(tmp), winsound.SND_FILENAME)
+        with wave.open(str(tmp), "wb") as wf:
+            wf.setnchannels(nch)
+            wf.setsampwidth(sw)
+            wf.setframerate(rate)
+            wf.writeframes(raw)
+        winsound.PlaySound(str(tmp), winsound.SND_FILENAME | winsound.SND_SYNC)
