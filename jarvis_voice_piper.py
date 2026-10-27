@@ -14,7 +14,10 @@
 """
 from __future__ import annotations
 
-import audioop
+try:
+    import audioop
+except ImportError:
+    audioop = None
 import urllib.request
 import wave
 import winsound
@@ -129,7 +132,7 @@ def speak_piper(text: str, voice: str = DEFAULT_PIPER_VOICE,
         raw = src.readframes(src.getnframes())
     silence = b"\x00" * (int(rate * 0.35) * nch * sw)
     raw = raw + silence
-    if 0.0 < volume < 1.0:
+    if audioop is not None and 0.0 < volume < 1.0:
         quiet = voices_dir() / "_say_q.wav"
         with wave.open(str(quiet), "wb") as wf:
             wf.setnchannels(nch)

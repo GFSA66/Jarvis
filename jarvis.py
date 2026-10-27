@@ -1555,9 +1555,24 @@ def play_track(query: str) -> None:
 
 
 def close_music_windows() -> None:
-    windows = _find_windows(YT_MUSIC_WINDOW_TITLE)
+    # Универсально: закрываем все видимые окна, чей заголовок похож на музыкальный
+    # плеер (YouTube Music, Spotify и любые другие с «music»/«spotify» в названии).
+    keys = ("music", "spotify", "youtube music", "медиа", "плеер")
+    windows = []
+    for h, title in visible_windows():
+        low = (title or "").lower()
+        if any(k in low for k in keys) and not any(p in low for p in PROTECTED_TITLES):
+            windows.append(h)
+    seen = set()
+    uniq = []
+    for h in windows:
+        if h in seen:
+            continue
+        seen.add(h)
+        uniq.append(h)
+    windows = uniq
     if not windows:
-        notify("Окна YouTube Music не найдены.", ok=False)
+        notify("Окна музыки не найдены.", ok=False)
         return
     closed = 0
     for hwnd in windows:  # WM_CLOSE, а не taskkill — обычные окна Chrome не трогаем
@@ -1566,7 +1581,7 @@ def close_music_windows() -> None:
             closed += 1
         except Exception as e:
             print(f"[music] не закрылось окно {hwnd}: {e}")
-    notify(f"Закрываю окон музыки: {closed}." if closed else "Не удалось закрыть окна YouTube Music.",
+    notify(f"Закрываю окон музыки: {closed}." if closed else "Не удалось закрыть окна музыки.",
            ok=bool(closed))
 
 
@@ -3809,7 +3824,10 @@ COMMANDS = [
     Cmd(lambda t: bool(TRACK_RE.search(t)), cmd_track, False),  # раньше «музык» и «песн»
     Cmd(lambda t: has(t, "музык") and CLOSE(t), lambda t: close_music_windows(), False),
     Cmd(lambda t: has(t, "музык"), lambda t: open_music(), False),
-    Cmd(lambda t: has(t, "песн"), lambda t: threading.Thread(target=_resume_last_track, daemon=True).start(), False),
+    Cmd(lambda t: has(t, "песн") and has(t, "выключ", "стоп", "пауза", "закрой"),
+        lambda t: (js.media_key("playpause"), notify("Переключаю воспроизведение.")), False),
+    Cmd(lambda t: has(t, "песн") and not has(t, "выключ", "стоп", "пауза", "закрой"),
+        lambda t: threading.Thread(target=_resume_last_track, daemon=True).start(), False),
     Cmd(lambda t: has(t, "геншин", "genshin") and launch_ok(t), cmd_genshin, True),
     Cmd(lambda t: _game_key(t) is not None, cmd_steam_game, True),
     Cmd(lambda t: has(t, "майнкрафт", "minecraft") and launch_ok(t),
@@ -4134,6 +4152,19 @@ def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> 
                         close_app(process, req["label"])
                         jarvis_history.DISPATCH.set("команда", text, "выполнена")
                         return
+                    # Сначала ищем окно по названию (в т.ч. частичное совпадение),
+                    # и только если окна нет — завершаем процесс по имени.
+                    try:
+                        res = js.close_window_by_name(req["target"], aliases)
+                        STATE.last_close_pids = res.get("pids") or []
+                        jarvis_history.DISPATCH.set("команда", text, "выполнена")
+                        if res.get("remaining"):
+                            notify(f"Закрыл {req['label']}. Окон: {res['closed']}.")
+                        else:
+                            notify(f"Закрыл {req['label']}." + (f" Окон: {res['closed']}." if res["closed"] > 1 else ""))
+                        return
+                    except Exception as e:  # noqa: BLE001
+                        log_error("Закрытие окна", e)
                     process = aliases.get(req["target"]) or _APP_PROCESS.get(
                         req["target"].lower(), req["target"])
                     close_app(process, req["label"])
@@ -4345,6 +4376,19 @@ def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> 
                 close_app(process, req["label"])
                 jarvis_history.DISPATCH.set("команда", text, "выполнена")
                 return
+            # Сначала ищем окно по названию (в т.ч. частичное совпадение),
+            # и только если окна нет — завершаем процесс по имени.
+            try:
+                res = js.close_window_by_name(req["target"], aliases)
+                STATE.last_close_pids = res.get("pids") or []
+                jarvis_history.DISPATCH.set("команда", text, "выполнена")
+                if res.get("remaining"):
+                    notify(f"Закрыл {req['label']}. Окон: {res['closed']}.")
+                else:
+                    notify(f"Закрыл {req['label']}." + (f" Окон: {res['closed']}." if res["closed"] > 1 else ""))
+                return
+            except Exception as e:  # noqa: BLE001
+                log_error("Закрытие окна", e)
             process = aliases.get(req["target"]) or _APP_PROCESS.get(
                 req["target"].lower(), req["target"])
             close_app(process, req["label"])
@@ -4429,7 +4473,7 @@ def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> 
         fixed = refine_text(text)
         if fixed and fixed != text:
             print(f"Уточнено: {fixed}")
-            process(fixed, refined=True, explicit=explicit)
+            _process_inner(fixed, refined=True, explicit=explicit)
             return
 
     if ask:  # обратились по имени, но это не команда — пусть ответит нейросеть

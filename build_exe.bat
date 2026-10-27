@@ -34,6 +34,9 @@ if not exist "jarvis.ico" echo [Jarvis] jarvis.ico not found - building with the
     --collect-all faster_whisper ^
     --collect-all ctranslate2 ^
     --collect-all piper ^
+    --collect-all onnxruntime ^
+    --collect-all audioop ^
+    --collect-all edge_tts ^
     --collect-data ytmusicapi ^
     --collect-data jarvis_settings ^
     --collect-data jarvis_utils ^
@@ -44,6 +47,7 @@ if not exist "jarvis.ico" echo [Jarvis] jarvis.ico not found - building with the
     --hidden-import pyttsx3.drivers ^
     --hidden-import pyttsx3.drivers.sapi5 ^
     --hidden-import onnxruntime ^
+    --hidden-import onnxruntime.capi._pybind_state ^
     --hidden-import faster_whisper ^
     --hidden-import ctranslate2 ^
     --hidden-import numpy ^
@@ -64,9 +68,12 @@ if not exist "jarvis.ico" echo [Jarvis] jarvis.ico not found - building with the
     --hidden-import jarvis_intents ^
     --hidden-import jarvis_routing ^
     --hidden-import jarvis_history ^
+    --hidden-import audioop ^
     --hidden-import jarvis_voice_piper ^
+    --hidden-import jarvis_voice_edge ^
+    --hidden-import edge_tts ^
     --hidden-import jarvis_dictation ^
-    jarvis.py jarvis_voice_piper.py jarvis_dictation.py jarvis_stt.py jarvis_intents.py jarvis_routing.py jarvis_history.py || goto :fail
+    jarvis.py jarvis_voice_piper.py jarvis_voice_edge.py jarvis_dictation.py jarvis_stt.py jarvis_intents.py jarvis_routing.py jarvis_history.py || goto :fail
 
 echo.
 echo [Jarvis] Done: dist\Jarvis.exe
@@ -76,6 +83,8 @@ rem run into %USERPROFILE%\.jarvis\models and stay outside the build (keeps exe 
 if not exist "dist\src" mkdir "dist\src"
 copy /y "jarvis.py" "dist\src\" >nul
 copy /y "jarvis_ai.py" "dist\src\" >nul
+copy /y "jarvis_voice_piper.py" "dist\src\" >nul
+copy /y "jarvis_voice_edge.py" "dist\src\" >nul
 copy /y "jarvis_settings.py" "dist\src\" >nul
 copy /y "jarvis_utils.py" "dist\src\" >nul
 copy /y "jarvis_system.py" "dist\src\" >nul

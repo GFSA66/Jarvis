@@ -323,7 +323,7 @@ build_exe.bat
 Для сборки PyInstaller уже добавлены `--hidden-import`/`--collect-data` новых модулей.
 При настройке через auto-py-to-exe используй те же hidden imports: `pycaw`, `comtypes`,
 `psutil`, `screen_brightness_control`, `keyring`, `winsdk`, `jarvis_utils`,
-`jarvis_system`, `jarvis_timers`, `jarvis_integrations`.
+`jarvis_system`, `jarvis_timers`, `jarvis_integrations`, `jarvis_voice_piper`, `jarvis_voice_edge`, `edge_tts`.
 
 ## Известные ограничения
 

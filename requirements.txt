@@ -3,6 +3,7 @@ SpeechRecognition>=3.10
 PyAudioWPatch
 pyttsx3
 piper-tts
+audioop-lts
 edge-tts
 pyautogui
 pywin32

@@ -382,10 +382,19 @@ def close_window_by_name(name: str, aliases: dict | None = None) -> dict:
     resolved = ((aliases or {}).get(target) or target).strip()
     words = [w for w in resolved.split() if w and w not in ("окно", "приложение", "программа")]
 
-    # (2) заголовок окна: все слова запроса есть в заголовке (без учёта регистра)
+    # (2) заголовок окна: запрос (или все его слова) есть в заголовке (без учёта регистра).
+    # Поддерживаем частичные совпадения: «microsoft» найдёт «Microsoft Store»,
+    # «spotify» найдёт «Spotify Premium», «microsoft store» — по подстроке.
     hwnds = [h for h, title in visible_windows()
-             if words and all(w in title.lower() for w in words)
+             if (target in title.lower()
+                 or (words and all(w in title.lower() for w in words))
+                 or (words and any(w in title.lower() for w in words) and len(words) == 1))
              and not any(p in title.lower() for p in PROTECTED_TITLES)]
+    # Если точного/подстрочного совпадения нет — пробуем любое слово (универсальный fallback).
+    if not hwnds and words:
+        hwnds = [h for h, title in visible_windows()
+                 if any(w in title.lower() for w in words)
+                 and not any(p in title.lower() for p in PROTECTED_TITLES)]
 
     # (3) имя exe
     pids = set()
