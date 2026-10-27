@@ -132,6 +132,8 @@ def speak_piper(text: str, voice: str = DEFAULT_PIPER_VOICE,
         raw = src.readframes(src.getnframes())
     silence = b"\x00" * (int(rate * 0.35) * nch * sw)
     raw = raw + silence
+    # Безопасное получение флага SND_SYNC (может отсутствовать в некоторых версиях winsound)
+    _snd_sync = getattr(winsound, "SND_SYNC", 0)
     if audioop is not None and 0.0 < volume < 1.0:
         quiet = voices_dir() / "_say_q.wav"
         with wave.open(str(quiet), "wb") as wf:
@@ -139,11 +141,11 @@ def speak_piper(text: str, voice: str = DEFAULT_PIPER_VOICE,
             wf.setsampwidth(sw)
             wf.setframerate(rate)
             wf.writeframes(audioop.mul(raw, sw, volume))
-        winsound.PlaySound(str(quiet), winsound.SND_FILENAME | winsound.SND_SYNC)
+        winsound.PlaySound(str(quiet), winsound.SND_FILENAME | _snd_sync)
     else:
         with wave.open(str(tmp), "wb") as wf:
             wf.setnchannels(nch)
             wf.setsampwidth(sw)
             wf.setframerate(rate)
             wf.writeframes(raw)
-        winsound.PlaySound(str(tmp), winsound.SND_FILENAME | winsound.SND_SYNC)
+        winsound.PlaySound(str(tmp), winsound.SND_FILENAME | _snd_sync)

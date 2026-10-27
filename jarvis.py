@@ -228,8 +228,10 @@ DEFAULT_CONFIG = {
         "play_mode": "время игр",
     },
     # Ручные пути, если автопоиск не справился:
-    # chrome, steam, discord, telegram, genshin, minecraft, prism
+    # chrome, steam, discord, telegram, genshin, minecraft, prism, spotify
     "paths": {},
+    # Предпочитаемый проигрыватель музыки: "ytmusic" (YouTube Music) или "spotify"
+    "music_player": "ytmusic",
     # Имя задачи планировщика (если Genshin нужно запускать от админа через schtasks)
     "genshin_task": None,
     "sites": {
@@ -240,6 +242,8 @@ DEFAULT_CONFIG = {
         "youtube": "https://www.youtube.com",
         "клод": "https://claude.ai",
         "claude": "https://claude.ai",
+        "спотифай": "https://open.spotify.com",
+        "spotify": "https://open.spotify.com",
     },
     "urls": {
         "films": "https://rezka.ag/films/best/",
@@ -644,6 +648,16 @@ def find_prism():
          _join(_env("PROGRAMFILES"), "PrismLauncher", "prismlauncher.exe"),
          shutil.which("prismlauncher")]
         + [d + r"PrismLauncher\prismlauncher.exe" for d in _drives()])
+
+
+@lru_cache(None)
+def find_spotify():
+    return _override("spotify") or _first_file([
+        _join(_env("LOCALAPPDATA"), "Spotify", "Spotify.exe"),
+        _join(_env("PROGRAMFILES"), "Spotify", "Spotify.exe"),
+        _join(_env("PROGRAMFILES(X86)"), "Spotify", "Spotify.exe"),
+        shutil.which("Spotify"),
+    ])
 
 
 def find_ytmusic_shortcut():
@@ -1298,11 +1312,59 @@ def speakable(message: str) -> str:
     return re.sub(r"\s{2,}", " ", text).strip(" \n\t:-,.")
 
 
+def _estimate_tts_duration(text: str, engine: str = None, rate: int = 175) -> int:
+    """Оцнет продолжительности речи в миллисекундах на основе количества слов и движка."""
+    if not text:
+        return 0
+        return 0
+    words = len(text.split())
+    if words == 0:
+        return 0
+    
+    if engine is None:
+        engine = (CFG.get("voice", {}).get("engine") or "piper").lower()
+    
+    if engine == "piper":
+        # Piper TTS: длина фонаем Determines скорость
+        # length_scale 1.0 = нормальный темп (rate 175 wpm)
+        wpm = rate
+        if wpm <= 0:
+            wpm = 175
+        base_sec = (words / wpm) * 60
+        # буфер на инициализацию и синтез модели
+        return int(base_sec * 1000 * 1.2)
+    
+    elif engine == "edge":
+        # Edge TTS - нейроголос Microsoft
+        # Также ориентировано на ~150-175 wpm
+        wpm = rate
+        if wpm <= 0:
+            wpm = 175
+        base_sec = (words / wpm) * 60
+        return int(base_sec * 1000 * 1.3)
+    
+    elif engine in ("sapi", "windows"):
+        # Windows SAPI - классический TTS
+        wpm = rate
+        if wpm <= 0:
+            wpm = 175
+        base_sec = (words / wpm) * 60
+        return int(base_sec * 1000 * 1.1)
+    
+    else:
+        # fallback - простое приближение
+        return max(3000, min(60000, 60 * len(text)))
+
+
 def notify(message: str, ok: bool = True, force_speak: bool = False) -> None:
     print((("[ok] " if ok else "[!!] ") + message))
     if notifier:
-        base = int(CFG.get("notifications", {}).get("duration_ms", 5000))
-        notifier.show(message, ok, max(base, min(15000, 60 * len(message))))
+        # Используем оценку длительности речи вместо фиксированного таймаута
+        tts_engine = (CFG.get("voice", {}).get("engine") or "piper").lower()
+        estimated_dur = _estimate_tts_duration(message, tts_engine)
+        # Минимальное 3 сек, максимальное 60 сек
+        base = max(3000, min(60000, estimated_dur))
+        notifier.show(message, ok, base)
     speak = bool(speaker and (STATE.voice_enabled or force_speak) and not STATE.dnd_mode)
     if speak:
         speaker.say(speakable(message))
@@ -1486,6 +1548,16 @@ def _resume_last_track() -> None:
 
 
 def open_music() -> None:
+    music_player = CFG.get("music_player", "ytmusic")
+    if music_player == "spotify":
+        path = find_spotify()
+        if path:
+            launch_app(path, "Spotify", "spotify")
+        else:
+            webbrowser.open("https://open.spotify.com")
+            notify("Открываю Spotify в браузере.")
+        return
+    # По умолчанию — YouTube Music
     lnk = find_ytmusic_shortcut()
     if lnk:
         shell_open(lnk)
@@ -1559,9 +1631,9 @@ def close_music_windows() -> None:
     # плеер (YouTube Music, Spotify и любые другие с «music»/«spotify» в названии).
     keys = ("music", "spotify", "youtube music", "медиа", "плеер")
     windows = []
-    for h, title in visible_windows():
+    for h, title in js.visible_windows():
         low = (title or "").lower()
-        if any(k in low for k in keys) and not any(p in low for p in PROTECTED_TITLES):
+        if any(k in low for k in keys) and not any(p in low for p in js.PROTECTED_TITLES):
             windows.append(h)
     seen = set()
     uniq = []
@@ -2906,7 +2978,7 @@ def ask_ai(question: str) -> None:
 # Стемы глаголов команд: даже если Google исказил слово («откртой», «постафф»),
 # фраза всё равно распознаётся как попытка команды и уходит на уточнение.
 _REFINE_STEMS = (
-    "откр", "запусти", "запуст", "включи", "включа", "выключа", "постав",
+    "откр", "запусти", "запуст", "постав",
     "сдела", "созда", "удали", "удал", "напиш", "напечата", "набер",
     "надикту", "дикту", "продикту", "найд", "загугл", "поищ", "перевед",
     "напомни", "напомн", "переключ", "смени", "закр", "очисти", "выведи",
@@ -3291,6 +3363,14 @@ def cmd_system_status(t):
 
 def cmd_close_any(t):
     aliases = CFG.get("system", {}).get("app_aliases", {}) or {}
+    # Музыкальные команды обрабатываются отдельно:
+    # «выключи песню/трек» -> пауза, «закрой музыку» -> закрыть окна
+    if has(t, "песн", "трек") and has(t, "выключ", "стоп", "пауза"):
+        cmd_media(t)
+        return
+    if has(t, "музык") and has(t, "закры", "закрыт", "закрыть"):
+        close_music_windows()
+        return
     # Локальная нормализация слота: «закрой ским/тим/с ним» → Steam без нейросети.
     # Глагол приводим к канонике («закроешь» → «закрой»), слот — к сущности.
     norm_t = jarvis_routing.normalize(t)
@@ -3744,6 +3824,10 @@ COMMANDS = [
     Cmd(lambda t: is_word(t, "выход", "выйти"), cmd_exit, False),
     Cmd(lambda t: is_word(t, "отмена", "отмени", "отменить") and not has(t, "напоминани"),
         cmd_cancel_shutdown, False),
+    Cmd(lambda t: has(t, "песн") and has(t, "выключ", "стоп", "пауза", "закрой"),
+        lambda t: (js.media_key("playpause"), notify("Переключаю воспроизведение.")), False),
+    Cmd(lambda t: has(t, "песн") and not has(t, "выключ", "стоп", "пауза", "закрой") and not TRACK_RE.search(t),
+        lambda t: threading.Thread(target=_resume_last_track, daemon=True).start(), False),
     Cmd(lambda t: has(t, "восстанови настройки"), cmd_restore_settings, False),
     Cmd(lambda t: has(t, "настройк"), cmd_settings, False),
     Cmd(lambda t: has(t, "лайкни трек", "добавь в плейлист"), cmd_music_ui, False),
@@ -3824,16 +3908,14 @@ COMMANDS = [
     Cmd(lambda t: bool(TRACK_RE.search(t)), cmd_track, False),  # раньше «музык» и «песн»
     Cmd(lambda t: has(t, "музык") and CLOSE(t), lambda t: close_music_windows(), False),
     Cmd(lambda t: has(t, "музык"), lambda t: open_music(), False),
-    Cmd(lambda t: has(t, "песн") and has(t, "выключ", "стоп", "пауза", "закрой"),
-        lambda t: (js.media_key("playpause"), notify("Переключаю воспроизведение.")), False),
-    Cmd(lambda t: has(t, "песн") and not has(t, "выключ", "стоп", "пауза", "закрой"),
-        lambda t: threading.Thread(target=_resume_last_track, daemon=True).start(), False),
     Cmd(lambda t: has(t, "геншин", "genshin") and launch_ok(t), cmd_genshin, True),
     Cmd(lambda t: _game_key(t) is not None, cmd_steam_game, True),
     Cmd(lambda t: has(t, "майнкрафт", "minecraft") and launch_ok(t),
         lambda t: launch_app(find_minecraft(), "Minecraft", "minecraft"), True),
     Cmd(lambda t: has(t, "призм", "prism") and launch_ok(t),
         lambda t: launch_app(find_prism(), "Prism Launcher", "prism"), True),
+    Cmd(lambda t: has(t, "спотифай", "spotify") and launch_ok(t),
+        lambda t: launch_app(find_spotify(), "Spotify", "spotify"), True),
     Cmd(lambda t: has(t, "роблокс", "roblox") and launch_ok(t), U("roblox"), True),
     Cmd(lambda t: has(t, "логик", "logik"), U("logika"), False),
     Cmd(lambda t: has(t, "стим", "steam") and CLOSE(t), lambda t: close_steam(), False),
@@ -4136,6 +4218,9 @@ def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> 
                 aliases = CFG.get("system", {}).get("app_aliases", {}) or {}
                 req = jarvis_routing.resolve_close(text, aliases)
                 if req["kind"] == "app":
+                    if has(text, "музык") and has(text, "выключ", "стоп", "пауза", "закрой"):
+                            cmd_media(text)
+                            return
                     # Discord запускается через Squirrel-Update.exe, который респавнит
                     # основной процесс — гасим «няню» и само приложение (cmd_close_discord).
                     # target может ещё содержать wake-слово/имя (вырезается ниже), поэтому
@@ -4359,8 +4444,22 @@ def _process_inner(text: str, refined: bool = False, explicit: bool = False) -> 
     # Локальные команды закрытия приложений — приоритетнее вопроса нейросети:
     # «закрой/выключи/заверши/останови телеграм» закрываем здесь, а не отдаём в ask_ai.
     if jarvis_routing.close_verb(text):
+        # Музыкальные команды: «выключи песню/трек» -> пауза, «закрой музыку» -> закрыть окна
+        if has(text, "песн", "трек") and has(text, "выключ", "стоп", "пауза"):
+            cmd_media(text)
+            jarvis_history.DISPATCH.set("команда", text, "выполнена")
+            return
+        if has(text, "музык") and has(text, "закры", "закрыт", "закрыть"):
+            close_music_windows()
+            jarvis_history.DISPATCH.set("команда", text, "выполнена")
+            return
         aliases = CFG.get("system", {}).get("app_aliases", {}) or {}
         req = jarvis_routing.resolve_close(text, aliases)
+        # Музыка обрабатывается отдельно — не через общий путь закрытия
+        if "музык" in (req.get("target") or "").lower() or "песн" in (req.get("target") or "").lower():
+            close_music_windows()
+            jarvis_history.DISPATCH.set("команда", text, "выполнена")
+            return
         if req["kind"] == "app":
             # Discord запускается через Squirrel-Update.exe, который респавнит
             # основной процесс — гасим «няню» и само приложение (cmd_close_discord).
